@@ -9,7 +9,7 @@ import {
   highlightJson,
   minifyJson,
   convertTimestamp,
-} from "/tools-core.js";
+} from "./tools-core.js";
 import {
   HISTORY_STORAGE_KEY,
   addHistoryRecord,
@@ -20,8 +20,8 @@ import {
   filterHistoryRecords,
   parseHistoryWithStatus,
   serializeHistory,
-} from "/history-core.js";
-import { renderQr } from "/qr.js";
+} from "./history-core.js";
+import { renderQr } from "./qr.js";
 
 const tools = [
   { id: "qr", mark: "⌗", name: "链接转二维码", short: "二维码", description: "把链接变成清晰、可下载的二维码。", keywords: "链接 网址 二维码 qr code" },
