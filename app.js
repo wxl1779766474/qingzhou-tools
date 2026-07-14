@@ -963,12 +963,12 @@ historyRoot.addEventListener("click", (event) => {
   }
   if (action === "history-clear") {
     historyUi.confirmClear = true;
-    renderHistoryDrawer();
+    updateHistoryClearControls();
     requestAnimationFrame(() => historyRoot.querySelector('[data-action="history-confirm-clear"]')?.focus());
   }
   if (action === "history-cancel-clear") {
     historyUi.confirmClear = false;
-    renderHistoryDrawer();
+    updateHistoryClearControls();
     requestAnimationFrame(() => historyRoot.querySelector('[data-action="history-clear"]')?.focus());
   }
   if (action === "history-confirm-clear") {
