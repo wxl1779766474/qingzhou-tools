@@ -203,14 +203,7 @@ function historyOperationLabel(record) {
   return `${tool?.short ?? record.tool} · ${action}`;
 }
 
-function renderHistoryDrawer() {
-  if (!historyUi.open) {
-    historyRoot.replaceChildren();
-    syncOverlayState();
-    return;
-  }
-
-  const currentTool = tools.find((item) => item.id === state.active);
+function renderHistoryContent() {
   const filterTool = historyUi.filter === "current" ? state.active : null;
   const filtered = filterHistoryRecords(historyRecords, filterTool);
   const groups = new Map();
@@ -247,12 +240,46 @@ function renderHistoryDrawer() {
     <p>${historyUi.filter === "current" && state.active === "text" ? "文本统计不会保存记录。" : "成功使用工具后，记录会自动出现在这里。"}</p>
   </div>`;
 
-  const clearControls = historyUi.confirmClear
+  return groupMarkup ? `<div class="history-groups">${groupMarkup}</div>` : emptyMarkup;
+}
+
+function updateHistoryFilterView() {
+  for (const filter of historyRoot.querySelectorAll('[data-action="history-filter"]')) {
+    const isActive = filter.dataset.value === historyUi.filter;
+    filter.classList.toggle("is-active", isActive);
+    filter.setAttribute("aria-pressed", String(isActive));
+  }
+
+  const content = historyRoot.querySelector(".history-content");
+  if (!content) return;
+  content.innerHTML = renderHistoryContent();
+  content.scrollTop = 0;
+}
+
+function renderHistoryClearControls() {
+  return historyUi.confirmClear
     ? `<span class="history-confirm-actions" role="group" aria-label="确认清空全部记录">
         <button class="history-confirm" type="button" data-action="history-confirm-clear">确认清空</button>
         <button class="history-cancel" type="button" data-action="history-cancel-clear">取消</button>
       </span>`
     : `<button class="history-clear" type="button" data-action="history-clear" ${historyRecords.length ? "" : "disabled"}>全部清空</button>`;
+}
+
+function updateHistoryClearControls() {
+  const currentControls = historyRoot.querySelector(".history-confirm-actions, .history-clear");
+  if (currentControls) currentControls.outerHTML = renderHistoryClearControls();
+}
+
+function renderHistoryDrawer() {
+  if (!historyUi.open) {
+    historyRoot.replaceChildren();
+    syncOverlayState();
+    return;
+  }
+
+  const currentTool = tools.find((item) => item.id === state.active);
+
+  const clearControls = renderHistoryClearControls();
 
   historyRoot.innerHTML = `
     <div class="history-backdrop" data-history-backdrop>
@@ -277,7 +304,7 @@ function renderHistoryDrawer() {
           <button class="history-filter ${historyUi.filter === "all" ? "is-active" : ""}" type="button" data-action="history-filter" data-value="all" aria-pressed="${historyUi.filter === "all"}">全部记录</button>
           <button class="history-filter ${historyUi.filter === "current" ? "is-active" : ""}" type="button" data-action="history-filter" data-value="current" aria-pressed="${historyUi.filter === "current"}">当前工具 · ${escapeHtml(currentTool?.short ?? "")}</button>
         </nav>
-        <div class="history-content">${groupMarkup ? `<div class="history-groups">${groupMarkup}</div>` : emptyMarkup}</div>
+        <div class="history-content">${renderHistoryContent()}</div>
       </aside>
     </div>`;
   syncOverlayState();
@@ -927,10 +954,12 @@ historyRoot.addEventListener("click", (event) => {
     });
   }
   if (action === "history-filter") {
+    if (button.dataset.value === historyUi.filter) return;
     historyUi.filter = button.dataset.value;
+    const wasConfirmingClear = historyUi.confirmClear;
     historyUi.confirmClear = false;
-    renderHistoryDrawer();
-    requestAnimationFrame(() => historyRoot.querySelector(`[data-action="history-filter"][data-value="${historyUi.filter}"]`)?.focus());
+    if (wasConfirmingClear) updateHistoryClearControls();
+    updateHistoryFilterView();
   }
   if (action === "history-clear") {
     historyUi.confirmClear = true;
