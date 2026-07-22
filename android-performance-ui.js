@@ -1,0 +1,1046 @@
+import {
+  appendPerformanceSample,
+  createPerformanceReport,
+  normalizePerformanceSample,
+  performanceReportToCsv,
+  performanceReportToJson,
+} from "./android-performance-core.js";
+import { createAndroidShellRunner, validateAndroidPackageName } from "./android-performance-commands.js";
+import { createPerformanceChart } from "./android-performance-chart.js";
+import { createPerformanceSession, inspectAndroidDevice } from "./android-performance-collectors.js";
+import { createPerformanceReportRepository } from "./android-performance-storage.js";
+
+const DEFAULT_DURATION_MINUTES = 10;
+const MAX_DURATION_MINUTES = 60;
+const REPORT_LIST_LIMIT = 20;
+
+const PHASE_LABELS = Object.freeze({
+  loading: "正在准备浏览器连接能力",
+  unsupported: "当前浏览器不可用",
+  idle: "等待连接",
+  connecting: "等待选择设备并在手机上授权",
+  connected: "设备已连接",
+  preparing: "正在准备测试",
+  running: "测试进行中",
+  stopping: "正在生成报告",
+  completed: "测试已完成",
+  error: "需要处理后重试",
+});
+
+const METRIC_PRESENTATION = Object.freeze({
+  cpu: {
+    field: "cpuPercent",
+    format: (value) => formatNumber(value, 1, "%"),
+  },
+  memory: {
+    field: "memoryPssMb",
+    format: (value) => formatNumber(value, 1, " MB"),
+  },
+  fps: {
+    field: "activeFps",
+    format: (value) => formatNumber(value, 1, ""),
+  },
+  jank: {
+    field: "jankRate",
+    format: (value) => formatNumber(value, 1, "%"),
+  },
+  network: {
+    field: "networkTotalBytes",
+    format: formatBytes,
+  },
+  temperature: {
+    field: "batteryTemperatureC",
+    format: (value) => formatNumber(value, 1, " °C"),
+  },
+});
+
+const END_REASON_LABELS = Object.freeze({
+  user: "用户停止",
+  "max-duration": "达到设定时长",
+  "device-disconnected": "设备断开",
+  "process-exited": "目标 App 进程退出",
+  "tool-switched": "切换工具",
+  error: "采集异常",
+});
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function finite(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatNumber(value, digits = 1, suffix = "") {
+  const number = finite(value);
+  return number === null ? "—" : `${number.toFixed(digits)}${suffix}`;
+}
+
+function formatBytes(value) {
+  const bytes = finite(value);
+  if (bytes === null) return "—";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function formatDuration(milliseconds) {
+  const totalSeconds = Math.max(0, Math.floor((finite(milliseconds) ?? 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatLocalDate(timestamp) {
+  if (!Number.isFinite(timestamp)) return "未知时间";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(timestamp));
+}
+
+function safeFilePart(value) {
+  return String(value || "android-app")
+    .replace(/[^A-Za-z0-9._-]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 80) || "android-app";
+}
+
+export function maskAndroidSerial(serial) {
+  const value = String(serial || "").trim();
+  if (!value) return "未提供";
+  if (value.length <= 4) return "••••";
+  return `${value.slice(0, 2)}${"•".repeat(Math.min(6, value.length - 4))}${value.slice(-2)}`;
+}
+
+export function deriveAndroidPerformanceSupport({
+  secureContext = globalThis.isSecureContext === true,
+  usb = globalThis.navigator?.usb,
+} = {}) {
+  if (!secureContext) {
+    return {
+      supported: false,
+      code: "insecure-context",
+      message: "请通过 HTTPS 或 localhost 打开页面后再连接 Android 设备。",
+    };
+  }
+  if (!usb) {
+    return {
+      supported: false,
+      code: "webusb-unsupported",
+      message: "请使用桌面版 Chrome 或 Edge。Safari、Firefox 和手机浏览器暂不支持 WebUSB ADB。",
+    };
+  }
+  return { supported: true, code: null, message: "浏览器支持 WebUSB，可以连接设备。" };
+}
+
+function packageNameOf(item) {
+  if (typeof item === "string") return item;
+  return String(item?.packageName || item?.name || "");
+}
+
+function packageUidOf(item) {
+  const uid = Number(item?.uid);
+  return Number.isSafeInteger(uid) && uid >= 0 ? uid : null;
+}
+
+function normalizePackages(items) {
+  const byName = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    const packageName = packageNameOf(item);
+    if (!packageName) continue;
+    byName.set(packageName, { packageName, uid: packageUidOf(item) });
+  }
+  return [...byName.values()].sort((left, right) => left.packageName.localeCompare(right.packageName));
+}
+
+function statusMessage(error) {
+  const code = error?.code;
+  if (code === "device-busy") {
+    return "USB 接口正被 Android Studio 或本机 adb 占用。请关闭相关程序，必要时运行 adb kill-server 后重新插拔。";
+  }
+  if (code === "connection-failed") {
+    return "连接或授权失败。请确认 USB 调试已开启，并在手机弹窗中允许这台电脑调试。";
+  }
+  if (code === "connection-timeout") return "等待设备选择或手机授权超时，请保持手机解锁后重试。";
+  if (code === "connection-cancelled") return "设备连接已取消。";
+  if (code === "insecure-context") return "Android 设备连接需要 HTTPS 或 localhost。";
+  if (code === "webusb-unsupported") return deriveAndroidPerformanceSupport().message;
+  if (code === "command_timeout") return "设备响应超时，请保持手机解锁后重试。";
+  return error instanceof Error && error.message
+    ? error.message
+    : "操作未完成，请检查数据线、USB 调试和设备授权后重试。";
+}
+
+function reportStatusForReason(reason) {
+  if (reason === "max-duration") return "completed";
+  if (reason === "user") return "stopped";
+  if (reason === "error") return "failed";
+  return "interrupted";
+}
+
+function mergeMetricSample(samples, rawSample) {
+  const sample = normalizePerformanceSample(rawSample);
+  const previous = samples.at(-1);
+  if (!previous || previous.timestamp !== sample.timestamp) {
+    return appendPerformanceSample(samples, sample);
+  }
+  return appendPerformanceSample(samples.slice(0, -1), {
+    ...previous,
+    ...Object.fromEntries(
+      Object.entries(sample).filter(([key, value]) => key === "timestamp" || key === "sequence" || value !== null),
+    ),
+  });
+}
+
+function createMarkup() {
+  return `
+    <div class="android-performance" data-performance-root>
+      <section class="performance-connection panel" aria-labelledby="performance-connect-title">
+        <div class="panel-header performance-panel-heading">
+          <div><p class="eyebrow">浏览器直连 ADB</p><h2 id="performance-connect-title">连接 Android 设备</h2><p>无需安装助手，浏览器通过 USB 直接读取已授权设备。</p></div>
+          <span class="performance-phase" data-performance-phase>正在检测</span>
+        </div>
+        <div class="panel-body performance-connection-body">
+          <div class="performance-support" data-performance-support role="status"></div>
+          <ol class="performance-steps" aria-label="连接前准备">
+            <li><span>1</span><div><strong>开启 USB 调试</strong><small>手机设置 → 开发者选项 → USB 调试</small></div></li>
+            <li><span>2</span><div><strong>使用可传数据的线缆</strong><small>连接后保持手机解锁</small></div></li>
+            <li><span>3</span><div><strong>允许调试授权</strong><small>在手机 RSA 弹窗中点击允许</small></div></li>
+          </ol>
+          <div class="performance-actions">
+            <button class="primary-button" type="button" data-performance-action="connect" disabled>连接 Android 设备</button>
+            <button class="ghost-button" type="button" data-performance-action="disconnect" hidden>断开设备</button>
+          </div>
+          <p class="performance-help">如果浏览器选择器里没有设备，请切换 USB 用途为“传输文件”，或更换数据线。本站不会把设备信息和采样数据上传云端。</p>
+        </div>
+      </section>
+
+      <section class="performance-device panel" aria-labelledby="performance-device-title">
+        <div class="panel-header performance-panel-heading">
+          <div><h2 id="performance-device-title">设备与目标 App</h2><p>默认识别当前前台应用，也可搜索或手动输入包名。</p></div>
+          <button class="ghost-button performance-compact-button" type="button" data-performance-action="refresh-device" disabled>重新识别</button>
+        </div>
+        <div class="panel-body performance-device-body">
+          <dl class="performance-device-facts">
+            <div><dt>设备</dt><dd data-device-field="model">未连接</dd></div>
+            <div><dt>系统</dt><dd data-device-field="android">—</dd></div>
+            <div><dt>刷新率</dt><dd data-device-field="refresh">—</dd></div>
+            <div><dt>序列号</dt><dd data-device-field="serial">—</dd></div>
+          </dl>
+          <div class="performance-app-picker">
+            <label class="field-label" for="performance-package">目标 App 包名</label>
+            <div class="performance-package-row">
+              <input class="field code-field" id="performance-package" data-performance-field="package" list="performance-packages" autocomplete="off" placeholder="com.example.app" disabled />
+              <datalist id="performance-packages"></datalist>
+              <button class="secondary-button" type="button" data-performance-action="use-foreground" disabled>使用前台 App</button>
+            </div>
+            <p class="performance-field-hint" data-package-hint>连接后自动识别。只允许标准 Android 包名，不会执行任意 Shell。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="performance-controls panel" aria-labelledby="performance-control-title">
+        <div class="panel-header performance-panel-heading">
+          <div><h2 id="performance-control-title">测试控制</h2><p>开始后在手机上手动操作 App，最长可测试 60 分钟。</p></div>
+          <time class="performance-timer" data-performance-timer aria-label="测试计时">00:00</time>
+        </div>
+        <div class="panel-body performance-control-body">
+          <label class="performance-duration"><span>计划时长</span><select class="field" data-performance-field="duration" disabled>
+            <option value="5">5 分钟</option>
+            <option value="10" selected>10 分钟</option>
+            <option value="15">15 分钟</option>
+            <option value="30">30 分钟</option>
+            <option value="60">60 分钟</option>
+          </select></label>
+          <div class="performance-actions">
+            <button class="primary-button" type="button" data-performance-action="start" disabled>开始测试</button>
+            <button class="performance-stop-button" type="button" data-performance-action="stop" disabled>停止并生成报告</button>
+          </div>
+          <p class="performance-control-message" data-performance-message aria-live="polite">请先连接设备。</p>
+        </div>
+      </section>
+
+      <section class="performance-live" aria-labelledby="performance-live-title">
+        <div class="performance-section-heading"><div><p class="eyebrow">实时采样</p><h2 id="performance-live-title">性能概览</h2></div><span>缺失项显示“—”，不会伪装成 0</span></div>
+        <div class="performance-metric-grid">
+          ${metricCard("cpu", "应用 CPU", "整机占比", "%")}
+          ${metricCard("memory", "PSS 内存", "目标全部进程", "MB")}
+          ${metricCard("fps", "活动渲染 FPS", "仅有新帧时估算", "FPS")}
+          ${metricCard("jank", "卡顿率", "按设备刷新预算", "%")}
+          ${metricCard("network", "网络区间流量", "开始与结束快照", "RX + TX")}
+          ${metricCard("temperature", "设备电池温度", "不是 CPU/GPU 温度", "°C")}
+        </div>
+        <div class="performance-chart-grid">
+          ${chartCard("cpu", "CPU 曲线", "整机占比 0–100%")}
+          ${chartCard("memory", "PSS 内存曲线", "目标进程合计")}
+          ${chartCard("frame", "帧耗时曲线", "普通 View/HWUI App")}
+        </div>
+      </section>
+
+      <section class="performance-report panel" aria-labelledby="performance-report-title">
+        <div class="panel-header performance-panel-heading">
+          <div><h2 id="performance-report-title">本次报告</h2><p>停止、断连或到达时长后生成；报告只保存在当前浏览器。</p></div>
+          <div class="performance-report-actions">
+            <button class="secondary-button performance-compact-button" type="button" data-performance-action="export-json" disabled>导出 JSON</button>
+            <button class="ghost-button performance-compact-button" type="button" data-performance-action="export-csv" disabled>导出 CSV</button>
+          </div>
+        </div>
+        <div class="panel-body performance-report-body" data-performance-report>
+          <div class="performance-report-empty"><span aria-hidden="true">⌁</span><strong>完成一次测试后查看汇总</strong><p>当前报告即使未能写入浏览器存储，仍可立即导出。</p></div>
+        </div>
+      </section>
+
+      <section class="performance-recent panel" aria-labelledby="performance-recent-title">
+        <div class="panel-header performance-panel-heading">
+          <div><h2 id="performance-recent-title">最近报告</h2><p>最多保留 20 份，点击即可恢复查看，不会重新连接或采集。</p></div>
+          <button class="ghost-button performance-compact-button" type="button" data-performance-action="clear-reports" disabled>清空报告</button>
+        </div>
+        <div class="panel-body performance-recent-body" data-performance-reports>
+          <p class="performance-reports-empty">暂无本地报告。</p>
+        </div>
+      </section>
+
+      <aside class="performance-limitations" aria-label="指标边界">
+        <strong>快速诊断边界</strong>
+        <p>Unity、Unreal、OpenGL 或 Vulkan 游戏可能没有可靠帧数据；USB 通常会充电，因此电量变化不能代表 App 精确功耗。若需重置网页 ADB 凭据，请清除本站浏览器数据。</p>
+      </aside>
+    </div>`;
+}
+
+function metricCard(key, title, hint, unit) {
+  return `<article class="performance-metric-card" data-metric-card="${key}">
+    <div><span class="performance-metric-label">${title}</span><small>${hint}</small></div>
+    <strong data-metric-value="${key}">—</strong>
+    <span class="performance-metric-unit">${unit}</span>
+    <p data-metric-status="${key}">等待测试</p>
+  </article>`;
+}
+
+function chartCard(key, title, hint) {
+  return `<article class="performance-chart-card"><header><div><h3>${title}</h3><p>${hint}</p></div><span data-chart-latest="${key}">—</span></header><canvas data-performance-chart="${key}" height="240"></canvas></article>`;
+}
+
+function normalizeDurationMinutes(value) {
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes)) return DEFAULT_DURATION_MINUTES;
+  return Math.min(MAX_DURATION_MINUTES, Math.max(1, Math.round(minutes)));
+}
+
+function currentSampleNetworkTotal(rawSample, normalized) {
+  const explicit = finite(rawSample?.networkRxBytes) ?? finite(rawSample?.rxBytes);
+  const explicitTx = finite(rawSample?.networkTxBytes) ?? finite(rawSample?.txBytes);
+  if (explicit !== null || explicitTx !== null) return (explicit ?? 0) + (explicitTx ?? 0);
+  const rx = finite(normalized.rxBytes);
+  const tx = finite(normalized.txBytes);
+  return rx === null && tx === null ? null : (rx ?? 0) + (tx ?? 0);
+}
+
+function createDownload(content, type, filename) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+export function createAndroidPerformanceTool({
+  showToast = () => {},
+  confirmLeave = (message) => globalThis.confirm?.(message) !== false,
+  loadAdbModule = () => import("./android-performance-adb.bundle.js"),
+  repository = null,
+} = {}) {
+  const runtime = {
+    root: null,
+    mounted: false,
+    phase: "loading",
+    adapter: null,
+    runner: null,
+    session: null,
+    device: null,
+    packages: [],
+    foregroundPackage: "",
+    selectedPackage: "",
+    startedAt: null,
+    latest: {},
+    samples: [],
+    currentReport: null,
+    reports: [],
+    charts: {},
+    timerId: null,
+    stopPromise: null,
+    loadToken: 0,
+    disconnectUnsubscribe: null,
+    repository: repository ?? createPerformanceReportRepository(),
+    storagePersistent: repository ? repository.persistent !== false : true,
+  };
+
+  const refs = {};
+
+  function captureRefs() {
+    refs.phase = runtime.root.querySelector("[data-performance-phase]");
+    refs.support = runtime.root.querySelector("[data-performance-support]");
+    refs.connect = runtime.root.querySelector('[data-performance-action="connect"]');
+    refs.disconnect = runtime.root.querySelector('[data-performance-action="disconnect"]');
+    refs.refresh = runtime.root.querySelector('[data-performance-action="refresh-device"]');
+    refs.start = runtime.root.querySelector('[data-performance-action="start"]');
+    refs.stop = runtime.root.querySelector('[data-performance-action="stop"]');
+    refs.package = runtime.root.querySelector('[data-performance-field="package"]');
+    refs.duration = runtime.root.querySelector('[data-performance-field="duration"]');
+    refs.packages = runtime.root.querySelector("#performance-packages");
+    refs.message = runtime.root.querySelector("[data-performance-message]");
+    refs.timer = runtime.root.querySelector("[data-performance-timer]");
+    refs.report = runtime.root.querySelector("[data-performance-report]");
+    refs.reports = runtime.root.querySelector("[data-performance-reports]");
+    refs.clearReports = runtime.root.querySelector('[data-performance-action="clear-reports"]');
+    refs.exportJson = runtime.root.querySelector('[data-performance-action="export-json"]');
+    refs.exportCsv = runtime.root.querySelector('[data-performance-action="export-csv"]');
+  }
+
+  function setPhase(phase, message = "") {
+    runtime.phase = phase;
+    if (!runtime.mounted) return;
+    refs.phase.textContent = PHASE_LABELS[phase] ?? phase;
+    refs.phase.dataset.state = phase;
+    if (message) refs.message.textContent = message;
+    updateControls();
+  }
+
+  function updateControls() {
+    if (!runtime.mounted) return;
+    const connected = Boolean(runtime.adapter?.connected && runtime.runner);
+    const connecting = Boolean(runtime.adapter?.connecting);
+    const busy = ["connecting", "preparing", "running", "stopping"].includes(runtime.phase);
+    const running = runtime.phase === "running" || runtime.phase === "stopping";
+    refs.connect.hidden = connected || connecting;
+    refs.disconnect.hidden = !connected && !connecting;
+    refs.connect.disabled = runtime.phase !== "idle" && runtime.phase !== "error";
+    refs.disconnect.disabled = runtime.phase === "stopping";
+    refs.refresh.disabled = !connected || busy;
+    refs.package.disabled = !connected || running || runtime.phase === "preparing";
+    refs.duration.disabled = !connected || running || runtime.phase === "preparing";
+    runtime.root.querySelector('[data-performance-action="use-foreground"]').disabled = !connected || running || !runtime.foregroundPackage;
+    refs.start.disabled = !connected || busy || !runtime.selectedPackage;
+    refs.stop.disabled = runtime.phase !== "running";
+    refs.exportJson.disabled = !runtime.currentReport;
+    refs.exportCsv.disabled = !runtime.currentReport;
+    refs.clearReports.disabled = !runtime.reports.length;
+  }
+
+  function updateDevice() {
+    if (!runtime.mounted) return;
+    const device = runtime.device;
+    const set = (field, value) => {
+      const node = runtime.root.querySelector(`[data-device-field="${field}"]`);
+      if (node) node.textContent = value;
+    };
+    set("model", device ? [device.manufacturer, device.model].filter(Boolean).join(" ") || "Android 设备" : "未连接");
+    set("android", device ? `Android ${device.androidVersion || "未知"} · API ${device.sdkVersion || device.sdk || "—"}` : "—");
+    set("refresh", device?.refreshRateHz ? `${Number(device.refreshRateHz).toFixed(0)} Hz` : "—");
+    set("serial", runtime.adapter?.device?.serial ? maskAndroidSerial(runtime.adapter.device.serial) : "—");
+    refs.packages.innerHTML = runtime.packages
+      .map((item) => `<option value="${escapeHtml(item.packageName)}"></option>`)
+      .join("");
+    refs.package.value = runtime.selectedPackage;
+    const hint = runtime.root.querySelector("[data-package-hint]");
+    if (hint) {
+      hint.textContent = runtime.foregroundPackage
+        ? `已识别前台 App：${runtime.foregroundPackage}`
+        : "未自动识别前台 App，请搜索或手动输入标准包名。";
+    }
+    updateControls();
+  }
+
+  function resetMetrics() {
+    runtime.latest = {};
+    runtime.samples = [];
+    for (const [key] of Object.entries(METRIC_PRESENTATION)) updateMetric(key, null, "等待测试");
+    for (const chart of Object.values(runtime.charts)) chart.setSamples([]);
+    for (const node of runtime.root?.querySelectorAll("[data-chart-latest]") ?? []) node.textContent = "—";
+  }
+
+  function updateMetric(key, value, status = "采集中") {
+    if (!runtime.mounted) return;
+    const presentation = METRIC_PRESENTATION[key];
+    const valueNode = runtime.root.querySelector(`[data-metric-value="${key}"]`);
+    const statusNode = runtime.root.querySelector(`[data-metric-status="${key}"]`);
+    const card = runtime.root.querySelector(`[data-metric-card="${key}"]`);
+    if (valueNode) valueNode.textContent = presentation.format(value);
+    if (statusNode) statusNode.textContent = status;
+    card?.classList.toggle("is-unavailable", finite(value) === null);
+  }
+
+  function metricStateLabel(rawSample) {
+    if (rawSample?.status === "unsupported") return "设备不支持";
+    if (rawSample?.status === "degraded") return "已降级采集";
+    if (rawSample?.status === "temporarily-unavailable") return "暂时无数据";
+    return "采集中";
+  }
+
+  function receiveSample(rawSample) {
+    if (!runtime.mounted || runtime.phase !== "running") return;
+    let sample;
+    try {
+      sample = normalizePerformanceSample(rawSample);
+      runtime.samples = mergeMetricSample(runtime.samples, rawSample);
+    } catch {
+      return;
+    }
+
+    const status = metricStateLabel(rawSample);
+    for (const [key, presentation] of Object.entries(METRIC_PRESENTATION)) {
+      if (key === "network") continue;
+      const value = sample[presentation.field];
+      if (value !== null) {
+        runtime.latest[presentation.field] = value;
+        updateMetric(key, value, status);
+      }
+    }
+    const networkTotal = currentSampleNetworkTotal(rawSample, sample);
+    if (networkTotal !== null) {
+      runtime.latest.networkTotalBytes = networkTotal;
+      updateMetric("network", networkTotal, rawSample?.metric === "network" ? "区间快照" : status);
+    }
+
+    runtime.charts.cpu?.appendSample(sample);
+    runtime.charts.memory?.appendSample(sample);
+    runtime.charts.frame?.appendSample(sample);
+    const cpuLatest = runtime.root.querySelector('[data-chart-latest="cpu"]');
+    const memoryLatest = runtime.root.querySelector('[data-chart-latest="memory"]');
+    const frameLatest = runtime.root.querySelector('[data-chart-latest="frame"]');
+    if (sample.cpuPercent !== null) cpuLatest.textContent = formatNumber(sample.cpuPercent, 1, "%");
+    if (sample.memoryPssMb !== null) memoryLatest.textContent = formatNumber(sample.memoryPssMb, 1, " MB");
+    if (sample.frameTimeMs !== null) frameLatest.textContent = formatNumber(sample.frameTimeMs, 1, " ms");
+  }
+
+  function handleCollectorStatus(event) {
+    if (!runtime.mounted || !event) return;
+    if (event.type === "metric" && event.metric && event.state) {
+      const key = event.metric === "memory" ? "memory"
+        : event.metric === "frame" ? "fps"
+          : event.metric === "battery" ? "temperature"
+            : event.metric;
+      const node = runtime.root.querySelector(`[data-metric-status="${key}"]`);
+      if (node && event.state !== "supported") node.textContent = event.reason || event.state;
+    }
+    if (event.type === "target" && event.reason === "process-restarting") {
+      refs.message.textContent = "目标 App 进程暂时消失，正在等待重新启动…";
+    }
+    if (
+      event.type === "session"
+      && event.phase === "completed"
+      && (runtime.phase === "running" || runtime.phase === "preparing")
+      && !runtime.stopPromise
+    ) {
+      void stop(event.reason || event.snapshot?.endReason || "error");
+    }
+  }
+
+  function startTimer() {
+    stopTimer();
+    runtime.timerId = setInterval(() => {
+      if (!runtime.startedAt || !runtime.mounted) return;
+      refs.timer.textContent = formatDuration(Date.now() - runtime.startedAt);
+    }, 1_000);
+  }
+
+  function stopTimer() {
+    if (runtime.timerId !== null) clearInterval(runtime.timerId);
+    runtime.timerId = null;
+  }
+
+  async function loadReports() {
+    try {
+      runtime.reports = await runtime.repository.listReports({ limit: REPORT_LIST_LIMIT });
+      runtime.storagePersistent = runtime.repository.persistent !== false;
+    } catch {
+      runtime.reports = [];
+      runtime.storagePersistent = false;
+    }
+    renderReports();
+  }
+
+  function renderReports() {
+    if (!runtime.mounted) return;
+    refs.clearReports.disabled = !runtime.reports.length;
+    refs.reports.innerHTML = runtime.reports.length
+      ? `<div class="performance-report-list">${runtime.reports.map((report) => {
+          const packageName = report.app?.packageName || "未知应用";
+          return `<article class="performance-report-row">
+            <button type="button" data-performance-action="open-report" data-report-id="${escapeHtml(report.id)}">
+              <span><strong>${escapeHtml(packageName)}</strong><small>${escapeHtml(formatLocalDate(report.createdAt))} · ${escapeHtml(formatDuration(report.endedAt - report.startedAt))}</small></span>
+              <span>${escapeHtml(report.status === "completed" ? "完成" : report.status === "stopped" ? "已停止" : "部分报告")}</span>
+            </button>
+            <button class="performance-report-delete" type="button" data-performance-action="delete-report" data-report-id="${escapeHtml(report.id)}" aria-label="删除 ${escapeHtml(packageName)} 报告">×</button>
+          </article>`;
+        }).join("")}</div>`
+      : `<p class="performance-reports-empty">${runtime.storagePersistent ? "暂无本地报告。" : "浏览器存储不可用，当前报告仍可导出。"}</p>`;
+  }
+
+  function reportMetric(label, value, hint) {
+    return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(hint)}</small></div>`;
+  }
+
+  function renderCurrentReport() {
+    if (!runtime.mounted || !runtime.currentReport) return;
+    const report = runtime.currentReport;
+    const summary = report.summary || {};
+    const reason = report.endReason || report.config?.endReason;
+    refs.report.innerHTML = `
+      <div class="performance-report-intro">
+        <div><span class="performance-report-status">${escapeHtml(END_REASON_LABELS[reason] || "测试报告")}</span><h3>${escapeHtml(report.app?.packageName || "Android App")}</h3><p>${escapeHtml(formatLocalDate(report.startedAt))} · ${escapeHtml(formatDuration(report.endedAt - report.startedAt))} · ${summary.sampleCount || 0} 个采样点</p></div>
+        <span>${escapeHtml(report.device?.model || "Android 设备")}</span>
+      </div>
+      <div class="performance-report-summary">
+        ${reportMetric("平均 CPU", formatNumber(summary.cpuPercent?.average, 1, "%"), `峰值 ${formatNumber(summary.cpuPercent?.maximum, 1, "%")}`)}
+        ${reportMetric("平均 PSS", formatNumber(summary.memoryPssMb?.average, 1, " MB"), `峰值 ${formatNumber(summary.memoryPssMb?.maximum, 1, " MB")}`)}
+        ${reportMetric("帧耗时 P95", formatNumber(summary.frames?.frameP95Ms ?? summary.frameTimeMs?.p95, 1, " ms"), `卡顿率 ${formatNumber(summary.frames?.jankRate ?? summary.jankRate?.average, 1, "%")}`)}
+        ${reportMetric("网络增量", formatBytes(summary.networkDelta?.totalBytes), "RX + TX 区间差值")}
+        ${reportMetric("最高电池温度", formatNumber(summary.batteryTemperatureC?.maximum, 1, " °C"), "设备电池传感器")}
+        ${reportMetric("数据状态", report.status === "completed" || report.status === "stopped" ? "完整" : "部分", runtime.storagePersistent ? "已尝试保存到本浏览器" : "请立即导出")}
+      </div>
+      <div class="performance-report-notes"><strong>结果说明</strong><p>这是快速诊断数据，不是实验室级功耗测试。缺失指标表示设备或目标渲染方式未提供相应数据。</p></div>`;
+    refs.exportJson.disabled = false;
+    refs.exportCsv.disabled = false;
+    updateMetric("network", summary.networkDelta?.totalBytes, summary.networkDelta?.totalBytes === null ? "暂无区间数据" : "测试区间 RX + TX");
+  }
+
+  async function saveReport(report) {
+    try {
+      await runtime.repository.saveReport(report);
+      runtime.storagePersistent = runtime.repository.persistent !== false;
+    } catch {
+      runtime.storagePersistent = false;
+      showToast("报告未能保存，请立即导出当前报告");
+    }
+    await loadReports();
+  }
+
+  function snapshotSamples(snapshot) {
+    const source = Array.isArray(snapshot?.samples) ? snapshot.samples : runtime.samples;
+    let samples = [];
+    for (const sample of source) {
+      try {
+        samples = mergeMetricSample(samples, sample);
+      } catch {
+        // A malformed optional metric must not prevent the partial report.
+      }
+    }
+    return samples;
+  }
+
+  async function finishReport(snapshot, reason) {
+    const endedAt = Number.isFinite(snapshot?.endedAtMs) ? snapshot.endedAtMs : Date.now();
+    const startedAt = Number.isFinite(snapshot?.startedAtMs)
+      ? snapshot.startedAtMs
+      : runtime.startedAt ?? endedAt;
+    const target = snapshot?.target || {};
+    const packageName = target.packageName || runtime.selectedPackage;
+    const samples = snapshotSamples(snapshot);
+    const report = createPerformanceReport({
+      createdAt: endedAt,
+      startedAt,
+      endedAt,
+      status: reportStatusForReason(reason),
+      endReason: reason,
+      phase: snapshot?.phase || "completed",
+      elapsedMs: snapshot?.elapsedMs ?? endedAt - startedAt,
+      latest: snapshot?.latest || {},
+      device: {
+        manufacturer: runtime.device?.manufacturer || null,
+        model: runtime.device?.model || runtime.adapter?.device?.name || "Android 设备",
+        androidVersion: runtime.device?.androidVersion || null,
+        sdkVersion: runtime.device?.sdkVersion ?? runtime.device?.sdk ?? null,
+        logicalCores: runtime.device?.logicalCores || null,
+        refreshRateHz: runtime.device?.refreshRateHz || null,
+        serialMasked: maskAndroidSerial(runtime.adapter?.device?.serial),
+      },
+      app: {
+        packageName,
+        uid: target.uid ?? runtime.packages.find((item) => item.packageName === packageName)?.uid ?? null,
+        pids: target.pids ?? [],
+      },
+      config: {
+        endReason: reason,
+        plannedDurationMinutes: normalizeDurationMinutes(refs.duration?.value),
+        localOnly: true,
+      },
+      capabilities: runtime.device?.capabilities || snapshot?.metrics || {},
+      metrics: snapshot?.metrics || {},
+      summary: {
+        endReason: reason,
+        metricStates: snapshot?.metrics || {},
+      },
+      samples,
+    }, { now: endedAt });
+    runtime.currentReport = report;
+    renderCurrentReport();
+    await saveReport(report);
+    return report;
+  }
+
+  async function inspectConnectedDevice() {
+    if (!runtime.runner) return;
+    refs.message.textContent = "正在读取设备、系统与前台 App 信息…";
+    const inspected = await inspectAndroidDevice(runtime.runner);
+    runtime.device = inspected;
+    runtime.packages = normalizePackages(inspected.thirdPartyPackages);
+    runtime.foregroundPackage = inspected.foregroundPackage || "";
+    runtime.selectedPackage = runtime.foregroundPackage
+      || runtime.selectedPackage
+      || runtime.packages[0]?.packageName
+      || "";
+    updateDevice();
+    const warning = inspected.warnings?.length ? `；${inspected.warnings[0]}` : "";
+    setPhase("connected", `设备已连接，确认目标 App 后即可开始${warning}`);
+  }
+
+  async function connect() {
+    if (!runtime.adapter || !["idle", "error"].includes(runtime.phase)) return false;
+    setPhase("connecting", "请在浏览器中选择 Android 设备，并查看手机上的 USB 调试授权弹窗。 ");
+    let selected;
+    try {
+      // connect() calls requestDevice as its first awaited operation. The bundle
+      // was preloaded on mount, so the WebUSB chooser keeps this click activation.
+      const connectionPromise = runtime.adapter.connect();
+      updateControls();
+      selected = await connectionPromise;
+      if (!selected) {
+        setPhase("idle", "已取消设备选择，可以随时重新连接。");
+        return false;
+      }
+      runtime.disconnectUnsubscribe?.();
+      runtime.disconnectUnsubscribe = runtime.adapter.onDisconnect((event) => {
+        void handleDeviceDisconnect(event);
+      });
+      runtime.runner = createAndroidShellRunner(runtime.adapter);
+      await inspectConnectedDevice();
+      return true;
+    } catch (error) {
+      if (runtime.adapter?.connected) await disconnect({ quiet: true });
+      if (!runtime.mounted) return false;
+      if (error?.code === "connection-cancelled") {
+        setPhase("idle", "设备连接已取消，可以随时重新连接。");
+        return false;
+      }
+      setPhase("error", statusMessage(error));
+      return false;
+    }
+  }
+
+  async function handleDeviceDisconnect(event) {
+    if (runtime.phase === "running" || runtime.phase === "preparing") {
+      await stop("device-disconnected");
+    }
+    runtime.runner = null;
+    runtime.device = null;
+    runtime.packages = [];
+    runtime.foregroundPackage = "";
+    updateDevice();
+    if (event?.reason !== "manual") {
+      setPhase("idle", "设备已断开，已保留现有数据并释放连接。重新插入后可再次连接。");
+    }
+  }
+
+  async function disconnect({ quiet = false } = {}) {
+    if (runtime.phase === "running" || runtime.phase === "preparing") await stop("user");
+    const adapter = runtime.adapter;
+    runtime.disconnectUnsubscribe?.();
+    runtime.disconnectUnsubscribe = null;
+    runtime.runner = null;
+    if (adapter?.connected) {
+      try {
+        await adapter.disconnect();
+      } catch (error) {
+        if (!quiet) showToast(statusMessage(error));
+      }
+    }
+    runtime.device = null;
+    runtime.packages = [];
+    runtime.foregroundPackage = "";
+    runtime.selectedPackage = "";
+    updateDevice();
+    setPhase("idle", quiet ? "连接已释放。" : "设备已断开，浏览器已释放 USB 接口。");
+  }
+
+  async function start() {
+    if (!runtime.runner || !["connected", "completed", "error"].includes(runtime.phase)) return false;
+    let packageName;
+    try {
+      packageName = validateAndroidPackageName(runtime.selectedPackage);
+    } catch (error) {
+      refs.message.textContent = statusMessage(error);
+      refs.package.focus();
+      return false;
+    }
+
+    const durationMinutes = normalizeDurationMinutes(refs.duration.value);
+    resetMetrics();
+    setPhase("preparing", "正在确认目标进程、记录网络基线并重置帧统计…");
+    runtime.session = createPerformanceSession({
+      runner: runtime.runner,
+      onSample: receiveSample,
+      onStatus: handleCollectorStatus,
+    });
+    try {
+      const started = await runtime.session.start({
+        packageName,
+        uid: runtime.packages.find((item) => item.packageName === packageName)?.uid ?? undefined,
+        logicalCores: runtime.device?.logicalCores,
+        refreshRateHz: runtime.device?.refreshRateHz,
+        maxDurationMs: durationMinutes * 60_000,
+      });
+      runtime.startedAt = Number.isFinite(started?.startedAtMs) ? started.startedAtMs : Date.now();
+      setPhase("running", `正在测试 ${packageName}。请在手机上手动操作，完成后点击“停止并生成报告”。`);
+      startTimer();
+      return true;
+    } catch (error) {
+      runtime.session = null;
+      setPhase("connected", statusMessage(error));
+      return false;
+    }
+  }
+
+  async function stop(reason = "user") {
+    if (runtime.stopPromise) return runtime.stopPromise;
+    if (!runtime.session) return null;
+    runtime.stopPromise = (async () => {
+      stopTimer();
+      setPhase("stopping", "正在停止采集并计算区间网络流量…");
+      let snapshot;
+      try {
+        snapshot = await runtime.session.stop(reason);
+      } catch {
+        snapshot = runtime.session.getSnapshot?.() || null;
+        reason = reason === "user" ? "error" : reason;
+      }
+      runtime.session = null;
+      await finishReport(snapshot, reason);
+      refs.timer.textContent = formatDuration((snapshot?.endedAtMs ?? Date.now()) - (snapshot?.startedAtMs ?? runtime.startedAt));
+      setPhase(runtime.adapter?.connected ? "completed" : "idle", `报告已生成：${END_REASON_LABELS[reason] || "测试结束"}。`);
+      showToast("Android 性能报告已生成");
+      return runtime.currentReport;
+    })().finally(() => {
+      runtime.stopPromise = null;
+    });
+    return runtime.stopPromise;
+  }
+
+  async function openReport(id) {
+    try {
+      const report = await runtime.repository.getReport(id);
+      if (!report) throw new Error("报告不存在");
+      runtime.currentReport = report;
+      renderCurrentReport();
+      refs.report.scrollIntoView?.({ behavior: "smooth", block: "start" });
+    } catch {
+      showToast("这份报告已不存在或无法读取");
+      await loadReports();
+    }
+  }
+
+  async function deleteReport(id) {
+    try {
+      await runtime.repository.deleteReport(id);
+      if (runtime.currentReport?.id === id) runtime.currentReport = null;
+      await loadReports();
+      showToast("报告已删除");
+    } catch {
+      showToast("报告删除失败，请重试");
+    }
+  }
+
+  async function clearReports() {
+    if (!runtime.reports.length) return;
+    if (!confirmLeave("确定清空全部 Android 性能报告吗？此操作无法撤销。")) return;
+    try {
+      await runtime.repository.clearReports();
+      runtime.reports = [];
+      renderReports();
+      showToast("Android 性能报告已清空");
+    } catch {
+      showToast("报告清空失败，请重试");
+    }
+  }
+
+  function exportReport(kind) {
+    const report = runtime.currentReport;
+    if (!report) return;
+    const stamp = new Date(report.startedAt).toISOString().replaceAll(":", "-").slice(0, 19);
+    const base = `android-performance-${safeFilePart(report.app?.packageName)}-${stamp}`;
+    if (kind === "json") {
+      createDownload(performanceReportToJson(report), "application/json;charset=utf-8", `${base}.json`);
+    } else {
+      createDownload(performanceReportToCsv(report, { includeBom: true }), "text/csv;charset=utf-8", `${base}.csv`);
+    }
+  }
+
+  async function handleClick(event) {
+    const button = event.target.closest("[data-performance-action]");
+    if (!button || !runtime.root.contains(button)) return;
+    const action = button.dataset.performanceAction;
+    if (action === "connect") await connect();
+    if (action === "disconnect") await disconnect();
+    if (action === "refresh-device") {
+      button.disabled = true;
+      try {
+        await inspectConnectedDevice();
+      } catch (error) {
+        setPhase("connected", statusMessage(error));
+      }
+    }
+    if (action === "use-foreground") {
+      runtime.selectedPackage = runtime.foregroundPackage;
+      refs.package.value = runtime.selectedPackage;
+      updateControls();
+    }
+    if (action === "start") await start();
+    if (action === "stop") await stop("user");
+    if (action === "open-report") await openReport(button.dataset.reportId);
+    if (action === "delete-report") await deleteReport(button.dataset.reportId);
+    if (action === "clear-reports") await clearReports();
+    if (action === "export-json") exportReport("json");
+    if (action === "export-csv") exportReport("csv");
+  }
+
+  function handleInput(event) {
+    const field = event.target.closest("[data-performance-field]");
+    if (!field) return;
+    if (field.dataset.performanceField === "package") {
+      runtime.selectedPackage = field.value.trim();
+      const hint = runtime.root.querySelector("[data-package-hint]");
+      try {
+        validateAndroidPackageName(runtime.selectedPackage);
+        field.removeAttribute("aria-invalid");
+        hint.textContent = "包名格式有效；开始时会确认 App 进程和 UID。";
+      } catch {
+        field.setAttribute("aria-invalid", "true");
+        hint.textContent = runtime.selectedPackage ? "请输入类似 com.example.app 的标准包名。" : "请选择或输入目标 App 包名。";
+      }
+      updateControls();
+    }
+  }
+
+  function handleBeforeUnload(event) {
+    if (runtime.phase !== "running" && runtime.phase !== "preparing") return;
+    event.preventDefault();
+    event.returnValue = "";
+  }
+
+  function createCharts() {
+    runtime.charts.cpu = createPerformanceChart(runtime.root.querySelector('[data-performance-chart="cpu"]'), {
+      title: "CPU 曲线",
+      series: [{ key: "cpuPercent", label: "CPU", unit: "%", color: "#0d7965" }],
+      minimum: 0,
+      maximum: 100,
+    });
+    runtime.charts.memory = createPerformanceChart(runtime.root.querySelector('[data-performance-chart="memory"]'), {
+      title: "PSS 内存曲线",
+      series: [{ key: "memoryPssMb", label: "PSS", unit: " MB", color: "#438cf0" }],
+      minimum: 0,
+    });
+    runtime.charts.frame = createPerformanceChart(runtime.root.querySelector('[data-performance-chart="frame"]'), {
+      title: "帧耗时曲线",
+      series: [{ key: "frameTimeMs", label: "帧耗时", unit: " ms", color: "#d97832" }],
+      minimum: 0,
+    });
+  }
+
+  async function initializeAdapter() {
+    const token = ++runtime.loadToken;
+    const support = deriveAndroidPerformanceSupport();
+    refs.support.className = `performance-support ${support.supported ? "is-supported" : "is-unsupported"}`;
+    refs.support.innerHTML = `<strong>${support.supported ? "浏览器可用" : "暂不支持"}</strong><span>${escapeHtml(support.message)}</span>`;
+    if (!support.supported) {
+      setPhase("unsupported", support.message);
+      return;
+    }
+    setPhase("loading", "正在加载本地 WebUSB ADB 模块…");
+    try {
+      const module = await loadAdbModule();
+      if (!runtime.mounted || token !== runtime.loadToken) return;
+      runtime.adapter = module.createBrowserAndroidPerformanceAdbAdapter();
+      const adapterSupport = runtime.adapter.getSupport();
+      if (!adapterSupport.supported) {
+        setPhase("unsupported", statusMessage({ code: adapterSupport.code }));
+        return;
+      }
+      setPhase("idle", "准备就绪。点击连接后，浏览器将打开系统设备选择器。 ");
+    } catch {
+      if (!runtime.mounted || token !== runtime.loadToken) return;
+      setPhase("error", "WebUSB ADB 模块加载失败，请刷新页面后重试。");
+    }
+  }
+
+  async function mount(root) {
+    if (!root) throw new TypeError("Android 性能工具需要挂载容器");
+    if (runtime.mounted && runtime.root === root) return;
+    if (runtime.mounted) await unmount();
+    runtime.root = root;
+    runtime.root.innerHTML = createMarkup();
+    runtime.mounted = true;
+    captureRefs();
+    runtime.root.addEventListener("click", handleClick);
+    runtime.root.addEventListener("input", handleInput);
+    globalThis.addEventListener?.("beforeunload", handleBeforeUnload);
+    createCharts();
+    resetMetrics();
+    await Promise.all([initializeAdapter(), loadReports()]);
+  }
+
+  async function beforeLeave() {
+    if (runtime.phase === "running" || runtime.phase === "preparing") {
+      const accepted = confirmLeave("Android 性能测试正在进行。离开后将停止采集并生成部分报告，是否继续？");
+      if (!accepted) return false;
+      await stop("tool-switched");
+    }
+    await disconnect({ quiet: true });
+    await unmount();
+    return true;
+  }
+
+  async function unmount() {
+    if (!runtime.mounted) return;
+    stopTimer();
+    runtime.loadToken += 1;
+    runtime.root.removeEventListener("click", handleClick);
+    runtime.root.removeEventListener("input", handleInput);
+    globalThis.removeEventListener?.("beforeunload", handleBeforeUnload);
+    for (const chart of Object.values(runtime.charts)) chart.destroy();
+    runtime.charts = {};
+    runtime.mounted = false;
+    runtime.root = null;
+  }
+
+  async function handleShortcut() {
+    if (["connected", "completed", "error"].includes(runtime.phase)) return start();
+    return false;
+  }
+
+  return Object.freeze({
+    mount,
+    beforeLeave,
+    unmount,
+    handleShortcut,
+    get isRunning() {
+      return runtime.phase === "running" || runtime.phase === "preparing" || runtime.phase === "stopping";
+    },
+    get phase() {
+      return runtime.phase;
+    },
+  });
+}
