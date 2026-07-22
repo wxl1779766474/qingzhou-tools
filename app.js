@@ -22,6 +22,7 @@ import {
   serializeHistory,
 } from "./history-core.js";
 import { renderQr } from "./qr.js";
+import { createAndroidPerformanceTool } from "./android-performance-ui.js";
 
 const tools = [
   { id: "qr", mark: "⌗", name: "链接转二维码", short: "二维码", description: "把链接变成清晰、可下载的二维码。", keywords: "链接 网址 二维码 qr code" },
@@ -30,6 +31,7 @@ const tools = [
   { id: "url", mark: "%", name: "URL 编解码", short: "URL", description: "处理完整网址或单独的参数值。", keywords: "url uri encode decode 参数" },
   { id: "timestamp", mark: "◷", name: "时间戳转换", short: "时间戳", description: "在秒、毫秒和可读时间之间转换。", keywords: "时间戳 timestamp 秒 毫秒 utc iso" },
   { id: "text", mark: "¶", name: "文本统计", short: "文本", description: "实时统计字符、词、行与字节。", keywords: "文本 字数 统计 字符 单词 行数 字节" },
+  { id: "android-performance", mark: "AP", name: "Android 性能测试", short: "性能", description: "浏览器通过 USB 直连手机，查看 App CPU、内存与帧表现。", keywords: "android 安卓 性能 测试 adb webusb cpu 内存 pss fps 帧 卡顿 电池 温度 网络" },
 ];
 
 const JSON_HIGHLIGHT_MAX_CHARACTERS = 120_000;
@@ -66,6 +68,8 @@ let jsonMarkupCache = { source: null, html: "", highlighted: false };
 let historyRecords = [];
 let historyTrigger = null;
 let historyStorageDisabled = false;
+let androidPerformanceTool = null;
+let navigationInProgress = false;
 const historyUi = { open: false, filter: "all", confirmClear: false };
 
 function escapeHtml(value) {
@@ -563,15 +567,23 @@ function renderTextTool() {
 
 function renderWorkspace() {
   const tool = tools.find((item) => item.id === state.active);
-  toolHeader.innerHTML = `<div class="workspace-title"><span class="workspace-mark" aria-hidden="true">${tool.mark}</span><div><p class="eyebrow">当前工具</p><h1>${tool.name}</h1><p>${tool.description}</p></div></div>
-    <div class="workspace-actions">
+  const historyAction = state.active === "android-performance" ? "" : `
       <button class="history-trigger" type="button" data-action="history-open" aria-haspopup="dialog" aria-controls="history-drawer" aria-expanded="${historyUi.open}">
         <span class="history-trigger-mark" aria-hidden="true">◴</span>
         <span>使用记录</span>
         <span class="history-count" data-history-count aria-label="${historyRecords.length} 条记录">${historyRecords.length}</span>
-      </button>
-      <span class="status-pill"><span aria-hidden="true">●</span> 数据仅在本地处理</span>
+      </button>`;
+  toolHeader.innerHTML = `<div class="workspace-title"><span class="workspace-mark" aria-hidden="true">${tool.mark}</span><div><p class="eyebrow">当前工具</p><h1>${tool.name}</h1><p>${tool.description}</p></div></div>
+    <div class="workspace-actions">
+      ${historyAction}
+      <span class="status-pill"><span aria-hidden="true">●</span> 本地处理，不上传云端</span>
     </div>`;
+  if (state.active === "android-performance") {
+    toolContent.replaceChildren();
+    void androidPerformanceTool.mount(toolContent);
+    renderJsonDialog();
+    return;
+  }
   if (state.active === "qr") toolContent.innerHTML = renderQrTool();
   if (state.active === "json") toolContent.innerHTML = renderJsonTool();
   if (state.active === "base64") toolContent.innerHTML = renderTwoWayTextTool("base64", { inputTitle: "输入文本", inputHint: "编码支持中文与 emoji，解码会严格校验", placeholder: "输入原文或 Base64 内容", outputHint: "UTF-8 安全转换" });
@@ -608,6 +620,10 @@ function drawQr() {
 }
 
 function runCurrentTool({ recordHistory = true } = {}) {
+  if (state.active === "android-performance") {
+    void androidPerformanceTool.handleShortcut();
+    return true;
+  }
   const current = state[state.active];
   const toolId = state.active;
   let historyAction = null;
@@ -821,15 +837,24 @@ function showToast(message) {
   toastTimer = setTimeout(() => toast.classList.remove("is-visible"), 1800);
 }
 
-toolNav.addEventListener("click", (event) => {
+toolNav.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-tool]");
-  if (!button) return;
-  closeHistoryDrawer({ restoreFocus: false });
-  closeJsonDialog({ restoreFocus: false });
-  state.active = button.dataset.tool;
-  renderNavigation(searchInput.value);
-  renderWorkspace();
-  document.querySelector("#workspace")?.focus({ preventScroll: true });
+  if (!button || navigationInProgress || button.dataset.tool === state.active) return;
+  navigationInProgress = true;
+  try {
+    if (state.active === "android-performance") {
+      const canLeave = await androidPerformanceTool.beforeLeave();
+      if (!canLeave) return;
+    }
+    closeHistoryDrawer({ restoreFocus: false });
+    closeJsonDialog({ restoreFocus: false });
+    state.active = button.dataset.tool;
+    renderNavigation(searchInput.value);
+    renderWorkspace();
+    document.querySelector("#workspace")?.focus({ preventScroll: true });
+  } finally {
+    navigationInProgress = false;
+  }
 });
 
 searchInput.addEventListener("input", () => renderNavigation(searchInput.value));
@@ -1011,5 +1036,6 @@ document.addEventListener("keydown", (event) => {
 });
 
 initializeHistory();
+androidPerformanceTool = createAndroidPerformanceTool({ showToast });
 renderNavigation();
 renderWorkspace();
