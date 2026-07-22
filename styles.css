@@ -1956,3 +1956,780 @@ body.dialog-open {
     border-width: 2px;
   }
 }
+
+/* Android performance testing */
+.android-performance {
+  display: grid;
+  gap: 22px;
+  padding-bottom: 42px;
+}
+
+.android-performance .panel {
+  box-shadow: 0 14px 38px rgba(37, 75, 68, 0.075);
+}
+
+.android-performance .panel-body {
+  min-height: 0;
+}
+
+.performance-panel-heading {
+  min-height: 72px;
+}
+
+.performance-panel-heading h2,
+.performance-panel-heading p {
+  margin: 0;
+}
+
+.performance-panel-heading h2 {
+  font-size: 17px;
+}
+
+.performance-panel-heading .eyebrow {
+  margin-bottom: 4px;
+  font-size: 10px;
+}
+
+.performance-phase {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.performance-phase::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #91a6a2;
+  box-shadow: 0 0 0 3px rgba(96, 117, 113, 0.1);
+}
+
+.performance-phase[data-state="idle"]::before,
+.performance-phase[data-state="connected"]::before,
+.performance-phase[data-state="completed"]::before {
+  background: var(--mint);
+  box-shadow: 0 0 0 3px rgba(29, 183, 150, 0.12);
+}
+
+.performance-phase[data-state="connecting"]::before,
+.performance-phase[data-state="preparing"]::before,
+.performance-phase[data-state="running"]::before,
+.performance-phase[data-state="stopping"]::before,
+.performance-phase[data-state="loading"]::before {
+  background: var(--blue);
+  box-shadow: 0 0 0 3px rgba(67, 140, 240, 0.13);
+  animation: performance-pulse 1.4s ease-in-out infinite;
+}
+
+.performance-phase[data-state="unsupported"]::before,
+.performance-phase[data-state="error"]::before {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px rgba(217, 77, 98, 0.12);
+}
+
+@keyframes performance-pulse {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.78);
+  }
+}
+
+.performance-connection-body {
+  gap: 18px;
+}
+
+.performance-support {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 6px 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--paper-soft);
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.performance-support strong {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--mint-soft);
+  color: var(--mint-dark);
+  font-size: 11px;
+}
+
+.performance-support.is-unsupported {
+  border-color: #efc6ce;
+  background: var(--danger-soft);
+}
+
+.performance-support.is-unsupported strong {
+  background: #ffe0e5;
+  color: #ad3448;
+}
+
+.performance-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.performance-steps li {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(248, 251, 250, 0.78);
+}
+
+.performance-steps li > span {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--mint-soft);
+  color: var(--mint-dark);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.performance-steps strong,
+.performance-steps small {
+  display: block;
+}
+
+.performance-steps strong {
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.performance-steps small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.performance-actions,
+.performance-report-actions,
+.performance-package-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.performance-help,
+.performance-field-hint,
+.performance-control-message {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.performance-help {
+  padding-left: 14px;
+  border-left: 3px solid #cce9e2;
+}
+
+.performance-device-body {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(320px, 1.25fr);
+  align-items: center;
+  gap: 22px;
+}
+
+.performance-device-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.performance-device-facts > div {
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper-soft);
+}
+
+.performance-device-facts dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.performance-device-facts dd {
+  margin: 3px 0 0;
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.performance-app-picker {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.performance-package-row .field {
+  min-width: 210px;
+  flex: 1 1 280px;
+}
+
+.performance-compact-button {
+  min-height: 38px;
+  padding: 7px 12px;
+  font-size: 12px;
+}
+
+.performance-control-body {
+  display: grid;
+  grid-template-columns: minmax(150px, 210px) auto minmax(220px, 1fr);
+  align-items: end;
+  gap: 16px;
+}
+
+.performance-duration {
+  display: grid;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.performance-duration .field {
+  height: 44px;
+}
+
+.performance-stop-button {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 9px 15px;
+  border: 1px solid #e7a8b3;
+  border-radius: 11px;
+  background: var(--danger-soft);
+  color: #b6384d;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.performance-stop-button:hover:not(:disabled) {
+  border-color: #dc8796;
+  background: #ffe4e9;
+}
+
+.performance-stop-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.performance-control-message {
+  align-self: center;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--paper-soft);
+  line-height: 1.5;
+}
+
+.performance-timer {
+  color: var(--mint-dark);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.performance-live {
+  display: grid;
+  gap: 14px;
+}
+
+.performance-section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 3px 2px 0;
+}
+
+.performance-section-heading h2,
+.performance-section-heading p {
+  margin: 0;
+}
+
+.performance-section-heading h2 {
+  font-size: 21px;
+  letter-spacing: -0.02em;
+}
+
+.performance-section-heading > span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.performance-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.performance-metric-card {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  padding: 16px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 100% 0, rgba(29, 183, 150, 0.1), transparent 46%),
+    rgba(255, 255, 255, 0.92);
+  box-shadow: var(--shadow-sm);
+}
+
+.performance-metric-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--mint), rgba(67, 140, 240, 0.35));
+}
+
+.performance-metric-card > div {
+  min-width: 0;
+  grid-column: 1 / -1;
+}
+
+.performance-metric-label,
+.performance-metric-card small {
+  display: block;
+}
+
+.performance-metric-label {
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.performance-metric-card small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.performance-metric-card strong {
+  min-width: 0;
+  margin-top: 9px;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: clamp(25px, 3vw, 34px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.performance-metric-card.is-unavailable strong {
+  color: #8ca09c;
+}
+
+.performance-metric-unit {
+  align-self: end;
+  padding-bottom: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.performance-metric-card > p {
+  grid-column: 1 / -1;
+  margin: 5px 0 0;
+  color: var(--mint-dark);
+  font-size: 10px;
+}
+
+.performance-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.performance-chart-card {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--paper);
+  box-shadow: var(--shadow-sm);
+}
+
+.performance-chart-card:last-child {
+  grid-column: 1 / -1;
+}
+
+.performance-chart-card header {
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.performance-chart-card h3,
+.performance-chart-card p {
+  margin: 0;
+}
+
+.performance-chart-card h3 {
+  font-size: 13px;
+}
+
+.performance-chart-card p {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.performance-chart-card header > span {
+  color: var(--mint-dark);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.performance-chart-card canvas {
+  width: 100%;
+  height: 240px;
+  display: block;
+}
+
+.performance-report-body {
+  gap: 18px;
+}
+
+.performance-report-empty {
+  min-height: 150px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 3px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 14px;
+  background: var(--paper-soft);
+  color: var(--muted);
+  text-align: center;
+}
+
+.performance-report-empty > span {
+  margin-bottom: 5px;
+  color: var(--mint);
+  font-size: 30px;
+}
+
+.performance-report-empty strong {
+  color: var(--ink-soft);
+  font-size: 14px;
+}
+
+.performance-report-empty p {
+  margin: 0;
+  font-size: 11px;
+}
+
+.performance-report-intro {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.performance-report-intro h3,
+.performance-report-intro p {
+  margin: 0;
+}
+
+.performance-report-intro h3 {
+  margin-top: 5px;
+  font-size: 20px;
+}
+
+.performance-report-intro p,
+.performance-report-intro > span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.performance-report-status {
+  display: inline-flex;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--mint-soft);
+  color: var(--mint-dark);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.performance-report-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.performance-report-summary > div {
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper-soft);
+}
+
+.performance-report-summary span,
+.performance-report-summary strong,
+.performance-report-summary small {
+  display: block;
+}
+
+.performance-report-summary span,
+.performance-report-summary small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.performance-report-summary strong {
+  margin: 4px 0 2px;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.performance-report-notes {
+  padding: 12px 14px;
+  border-left: 3px solid var(--blue);
+  border-radius: 0 10px 10px 0;
+  background: var(--blue-soft);
+  color: #365f96;
+  font-size: 11px;
+}
+
+.performance-report-notes p {
+  margin: 2px 0 0;
+}
+
+.performance-recent-body {
+  padding-top: 14px;
+}
+
+.performance-report-list {
+  display: grid;
+  gap: 8px;
+}
+
+.performance-report-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper-soft);
+}
+
+.performance-report-row > button:first-child {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 11px 13px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: pointer;
+  text-align: left;
+}
+
+.performance-report-row > button:first-child:hover {
+  background: var(--mint-soft);
+}
+
+.performance-report-row span,
+.performance-report-row strong,
+.performance-report-row small {
+  display: block;
+}
+
+.performance-report-row span:first-child {
+  min-width: 0;
+}
+
+.performance-report-row strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.performance-report-row small,
+.performance-report-row span:last-child {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.performance-report-delete {
+  width: 42px;
+  border: 0;
+  border-left: 1px solid var(--line);
+  background: var(--paper);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 20px;
+}
+
+.performance-report-delete:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.performance-reports-empty {
+  margin: 0;
+  padding: 24px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 12px;
+  color: var(--muted);
+  text-align: center;
+  font-size: 12px;
+}
+
+.performance-limitations {
+  padding: 14px 16px;
+  border: 1px solid #d5e3f8;
+  border-radius: 14px;
+  background: rgba(234, 242, 255, 0.68);
+  color: #49698d;
+  font-size: 11px;
+}
+
+.performance-limitations p {
+  margin: 3px 0 0;
+}
+
+@media (max-width: 1020px) {
+  .performance-device-body,
+  .performance-control-body {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .performance-chart-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .performance-chart-card:last-child {
+    grid-column: auto;
+  }
+}
+
+@media (max-width: 760px) {
+  .android-performance {
+    gap: 16px;
+  }
+
+  .performance-panel-heading {
+    align-items: flex-start;
+  }
+
+  .performance-steps {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .performance-metric-grid,
+  .performance-report-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .performance-section-heading {
+    align-items: flex-start;
+  }
+
+  .performance-section-heading > span {
+    max-width: 145px;
+    text-align: right;
+  }
+}
+
+@media (max-width: 480px) {
+  .performance-panel-heading {
+    display: grid;
+  }
+
+  .performance-phase {
+    width: fit-content;
+    white-space: normal;
+  }
+
+  .performance-support {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .performance-device-facts,
+  .performance-metric-grid,
+  .performance-report-summary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .performance-package-row > button,
+  .performance-actions > button,
+  .performance-report-actions > button {
+    flex: 1 1 auto;
+  }
+
+  .performance-section-heading,
+  .performance-report-intro {
+    display: grid;
+  }
+
+  .performance-section-heading > span {
+    max-width: none;
+    text-align: left;
+  }
+
+  .performance-chart-card canvas {
+    height: 210px;
+  }
+}
