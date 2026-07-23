@@ -224,13 +224,56 @@ function createLinkedAbort(parentSignal, timeoutMs) {
     }, timeoutMs);
   }
 
+  const clearAbortTimeout = () => {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+    timeoutId = null;
+  };
+
   return {
     signal: controller.signal,
+    clearTimeout: clearAbortTimeout,
     cleanup() {
-      if (timeoutId !== null) clearTimeout(timeoutId);
+      clearAbortTimeout();
       removeParentListener();
     },
   };
+}
+
+function raceWithAbort(promise, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function disposeLateStream(stream) {
+  if (!stream || typeof stream !== "object") return;
+  const cleanupTasks = [];
+  if (typeof stream.kill === "function") {
+    cleanupTasks.push(Promise.resolve().then(() => stream.kill()));
+  }
+  for (const source of [stream.stdout, stream.stderr]) {
+    if (typeof source?.cancel === "function" && !source.locked) {
+      cleanupTasks.push(Promise.resolve().then(() => source.cancel()));
+    }
+  }
+  await Promise.allSettled(cleanupTasks);
+  try {
+    stream.__androidRunnerCleanup?.();
+  } catch {
+    // A late handle is already detached. Cleanup remains best effort.
+  }
 }
 
 /**
@@ -254,10 +297,15 @@ export function createAndroidShellRunner(adapter) {
       const linkedAbort = createLinkedAbort(options.signal, options.timeoutMs);
       const startedAt = nowMilliseconds();
       try {
-        const result = await adapter.runCommandText(command, {
-          signal: linkedAbort.signal,
-          maxOutputBytes: options.maxBytes,
-        });
+        const result = await raceWithAbort(
+          Promise.resolve(
+            adapter.runCommandText(command, {
+              signal: linkedAbort.signal,
+              maxOutputBytes: options.maxBytes,
+            }),
+          ),
+          linkedAbort.signal,
+        );
         return normalizeCommandResult(result, nowMilliseconds() - startedAt, options.maxBytes);
       } finally {
         linkedAbort.cleanup();
@@ -273,11 +321,19 @@ export function createAndroidShellRunner(adapter) {
       }
       const command = buildAndroidCommand(commandId, args);
       const linkedAbort = createLinkedAbort(options.signal, options.timeoutMs);
+      let pendingStart = null;
       try {
-        const stream = await adapter.startCommand(command, {
-          signal: linkedAbort.signal,
-          maxOutputBytes: options.maxBytes,
-        });
+        pendingStart = Promise.resolve(
+          adapter.startCommand(command, {
+            signal: linkedAbort.signal,
+            maxOutputBytes: options.maxBytes,
+          }),
+        );
+        const stream = await raceWithAbort(pendingStart, linkedAbort.signal);
+        // timeoutMs bounds stream creation only. Once open succeeds, keep the
+        // parent abort link alive for the stream lifetime without killing a
+        // healthy long-running `top` process when the startup deadline passes.
+        linkedAbort.clearTimeout();
         if (stream && typeof stream === "object") {
           // The ADB adapter deliberately returns frozen handles. Keep its
           // streams/cancellation methods while adding a private lifecycle hook
@@ -294,6 +350,9 @@ export function createAndroidShellRunner(adapter) {
         linkedAbort.cleanup();
         return stream;
       } catch (error) {
+        if (pendingStart && linkedAbort.signal.aborted) {
+          void pendingStart.then(disposeLateStream, () => {});
+        }
         linkedAbort.cleanup();
         throw error;
       }
