@@ -252,6 +252,62 @@ function latestFieldValue(samples, field) {
   return null;
 }
 
+function latestCpuSource(samples, report) {
+  const reportSource = report?.metrics?.cpu?.source;
+  if (typeof reportSource === "string" && reportSource) return reportSource;
+  for (let index = samples.length - 1; index >= 0; index -= 1) {
+    const sample = samples[index];
+    if (
+      (finite(sample?.cpuPercent) !== null || finite(sample?.cpuRawPercent) !== null)
+      && typeof sample?.source === "string"
+      && sample.source
+    ) {
+      return sample.source;
+    }
+  }
+  return null;
+}
+
+function latestCpuState(report, source) {
+  const reportState = report?.metrics?.cpu?.state;
+  if (typeof reportState === "string" && reportState) return reportState;
+  return normalizeCpuSource(source) === "top" ? "supported" : "degraded";
+}
+
+function normalizeCpuSource(source) {
+  const normalized = typeof source === "string" ? source.trim().toLowerCase() : "";
+  if (normalized === "top") return "top";
+  if (["proc", "proc-stat", "procfs"].includes(normalized)) return "proc";
+  if (normalized === "cpuinfo") return "cpuinfo";
+  return null;
+}
+
+export function getPerformanceCpuStatusLabel({
+  source = null,
+  state = null,
+  status = null,
+  report = false,
+} = {}) {
+  if (report) {
+    if (normalizeCpuSource(source) === null) return "报告最终值";
+    const sourceLabel = getPerformanceCpuStatusLabel({ source, state, status });
+    return sourceLabel === "等待首个 CPU 样本"
+      ? "报告最终值"
+      : `报告最终值 · ${sourceLabel}`;
+  }
+  if (["probing", "pending"].includes(state)) return "等待首个 CPU 样本";
+  if (state === "paused" || status === "temporarily-unavailable") return "CPU 暂时无数据";
+  if (state === "unsupported" || status === "unsupported") return "CPU 采集不可用";
+
+  const normalizedSource = normalizeCpuSource(source);
+  if (normalizedSource === "top") return "正常采集";
+  if (normalizedSource === "proc") return "已切换到 1 秒兼容采集";
+  if (normalizedSource === "cpuinfo") return "低频兜底采集";
+  if (state === "supported" || status === "ok") return "正常采集";
+  if (state === "degraded" || status === "degraded") return "兼容采集中";
+  return "CPU 状态更新";
+}
+
 export function createPerformanceReportView(report) {
   const samples = normalizePerformanceMetricSamples(report?.samples);
   const charts = Object.fromEntries(
@@ -268,10 +324,13 @@ export function createPerformanceReportView(report) {
   );
   latest.cpuRawPercent = latestFieldValue(samples, "cpuRawPercent");
   latest.networkTotalBytes = finite(report?.summary?.networkDelta?.totalBytes);
+  const cpuSource = latestCpuSource(samples, report);
   return {
     samples,
     charts,
     latest,
+    cpuSource,
+    cpuState: latestCpuState(report, cpuSource),
     cpuUsesRawValue: latest.cpuPercent === null && latest.cpuRawPercent !== null,
   };
 }
@@ -560,6 +619,12 @@ export function createAndroidPerformanceTool({
   }
 
   function metricStateLabel(rawSample) {
+    if (rawSample?.metric === "cpu") {
+      return getPerformanceCpuStatusLabel({
+        source: rawSample.source,
+        status: rawSample.status,
+      });
+    }
     if (rawSample?.status === "unsupported") return "设备不支持";
     if (rawSample?.status === "degraded") return "已降级采集";
     if (rawSample?.status === "temporarily-unavailable") return "暂时无数据";
@@ -617,14 +682,11 @@ export function createAndroidPerformanceTool({
             ? [event.metric]
             : [];
       const label = event.metric === "cpu"
-        ? (
-            ["probing", "pending"].includes(event.state) ? "等待首个 CPU 样本"
-              : event.state === "supported" ? "CPU 采集中"
-                : event.state === "degraded" ? "已降级为低频 CPU 采集"
-                  : event.state === "paused" ? "CPU 暂时无数据"
-                    : event.state === "unsupported" ? "CPU 采集不可用"
-                      : "CPU 状态更新"
-          )
+        ? getPerformanceCpuStatusLabel({
+            source: event.source ?? event.snapshot?.metrics?.cpu?.source,
+            state: event.state,
+            status: event.status,
+          })
         : (
             event.state === "supported" ? "采集中"
               : event.state === "degraded" ? "已降级采集"
@@ -731,6 +793,12 @@ export function createAndroidPerformanceTool({
         : view.latest[presentation.field];
       const status = value === null
         ? "报告无数据"
+        : key === "cpu"
+          ? getPerformanceCpuStatusLabel({
+              source: view.cpuSource,
+              state: view.cpuState,
+              report: true,
+            })
         : key === "network"
           ? "测试区间 RX + TX"
           : "报告最终值";
