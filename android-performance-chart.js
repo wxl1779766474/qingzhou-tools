@@ -1,7 +1,10 @@
 import {
   appendPerformanceSample,
   downsamplePerformanceSamples,
+  normalizePerformanceSample,
 } from "./android-performance-core.js";
+
+const DEFAULT_WINDOW_MS = 10 * 60 * 1_000;
 
 const DEFAULT_SERIES = Object.freeze([
   Object.freeze({
@@ -39,6 +42,141 @@ function finiteValues(samples, series) {
     }
   }
   return values;
+}
+
+function hasSeriesValue(sample, series) {
+  return series.some((item) => {
+    const value = sample[item.key];
+    return typeof value === "number" && Number.isFinite(value);
+  });
+}
+
+function normalizeWindowMs(value) {
+  if (value === Number.POSITIVE_INFINITY) return value;
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : DEFAULT_WINDOW_MS;
+}
+
+function trimToWindow(samples, windowMs) {
+  if (!samples.length || windowMs === Number.POSITIVE_INFINITY) return samples;
+  const cutoff = samples.at(-1).timestamp - windowMs;
+  return samples.filter((sample) => sample.timestamp >= cutoff);
+}
+
+function normalizeChartSamples(samples, series, windowMs) {
+  const source = samples ?? [];
+  const normalized = downsamplePerformanceSamples(
+    source,
+    Math.max(2, Array.isArray(source) ? source.length : 2),
+  );
+  return trimToWindow(
+    normalized.filter((sample) => hasSeriesValue(sample, series)),
+    windowMs,
+  );
+}
+
+function compareSamples(left, right) {
+  return left.timestamp - right.timestamp ||
+    (left.sequence ?? Number.MAX_SAFE_INTEGER) -
+      (right.sequence ?? Number.MAX_SAFE_INTEGER);
+}
+
+function sampleProminence(sample, first, last, series) {
+  const duration = last.timestamp - first.timestamp;
+  const elapsedRatio = duration > 0
+    ? (sample.timestamp - first.timestamp) / duration
+    : 0;
+  let prominence = 0;
+
+  for (const item of series) {
+    const value = sample[item.key];
+    if (!Number.isFinite(value)) continue;
+    const firstValue = first[item.key];
+    const lastValue = last[item.key];
+    const expected = Number.isFinite(firstValue) && Number.isFinite(lastValue)
+      ? firstValue + (lastValue - firstValue) * elapsedRatio
+      : 0;
+    prominence = Math.max(prominence, Math.abs(value - expected));
+  }
+
+  return prominence;
+}
+
+function selectBucketSamples(bucket, series) {
+  if (!bucket.length) return [];
+  const selected = new Set([bucket[0], bucket.at(-1)]);
+
+  for (const item of series) {
+    let minimum = null;
+    let maximum = null;
+    for (const sample of bucket) {
+      const value = sample[item.key];
+      if (!Number.isFinite(value)) continue;
+      if (minimum === null || value < minimum[item.key]) minimum = sample;
+      if (maximum === null || value > maximum[item.key]) maximum = sample;
+    }
+    if (minimum) selected.add(minimum);
+    if (maximum) selected.add(maximum);
+  }
+
+  return [...selected].sort(compareSamples);
+}
+
+function downsampleChartSamples(samples, series, maxPoints) {
+  if (samples.length <= maxPoints) return samples;
+
+  const first = samples[0];
+  const last = samples.at(-1);
+  if (maxPoints === 2) return [first, last];
+
+  const interior = samples.slice(1, -1);
+  const interiorBudget = maxPoints - 2;
+  const maximumSamplesPerBucket = 2 + series.length * 2;
+  const bucketCount = Math.max(
+    1,
+    Math.floor(interiorBudget / maximumSamplesPerBucket),
+  );
+  const buckets = Array.from({ length: bucketCount }, () => []);
+  const duration = last.timestamp - first.timestamp;
+
+  for (let index = 0; index < interior.length; index += 1) {
+    const sample = interior[index];
+    const bucketIndex = duration > 0
+      ? Math.min(
+          bucketCount - 1,
+          Math.floor(((sample.timestamp - first.timestamp) / duration) * bucketCount),
+        )
+      : Math.min(
+          bucketCount - 1,
+          Math.floor((index / Math.max(1, interior.length)) * bucketCount),
+        );
+    buckets[bucketIndex].push(sample);
+  }
+
+  const candidates = [
+    first,
+    ...buckets.flatMap((bucket) => selectBucketSamples(bucket, series)),
+    last,
+  ];
+  if (candidates.length <= maxPoints) return candidates;
+
+  const selectedInterior = candidates
+    .slice(1, -1)
+    .map((sample, index) => ({
+      sample,
+      index,
+      prominence: sampleProminence(sample, first, last, series),
+    }))
+    .sort(
+      (left, right) =>
+        right.prominence - left.prominence ||
+        left.index - right.index,
+    )
+    .slice(0, interiorBudget)
+    .map(({ sample }) => sample);
+
+  return [first, ...selectedInterior, last].sort(compareSamples);
 }
 
 function formatNumber(value) {
@@ -82,6 +220,7 @@ export function createPerformanceChart(canvas, options = {}) {
   const maxPoints = Number.isSafeInteger(options.maxPoints) && options.maxPoints >= 2
     ? options.maxPoints
     : 300;
+  const windowMs = normalizeWindowMs(options.windowMs);
   const defaultWidth = Math.max(240, Number(options.width) || 640);
   const defaultHeight = Math.max(160, Number(options.height) || 260);
   const emptyText = String(options.emptyText ?? "开始测试后显示实时曲线");
@@ -123,6 +262,7 @@ export function createPerformanceChart(canvas, options = {}) {
   }
 
   function drawEmptyState() {
+    canvas.setAttribute?.("aria-label", `${title}，暂无数据`);
     context.fillStyle = options.mutedColor ?? "#607571";
     context.font = '13px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
     context.textAlign = "center";
@@ -136,7 +276,7 @@ export function createPerformanceChart(canvas, options = {}) {
     context.fillStyle = options.backgroundColor ?? "#f8fbfa";
     context.fillRect(0, 0, cssWidth, cssHeight);
 
-    const points = downsamplePerformanceSamples(samples, maxPoints);
+    const points = downsampleChartSamples(samples, series, maxPoints);
     const values = finiteValues(points, series);
     if (!points.length || !values.length) {
       drawEmptyState();
@@ -231,15 +371,21 @@ export function createPerformanceChart(canvas, options = {}) {
 
   function setSamples(nextSamples) {
     if (destroyed) return;
-    samples = downsamplePerformanceSamples(nextSamples ?? [], Math.max(maxPoints * 4, maxPoints));
+    samples = normalizeChartSamples(nextSamples, series, windowMs);
     requestDraw();
   }
 
   function appendSample(sample) {
     if (destroyed) return;
-    samples = appendPerformanceSample(samples, sample, {
-      limit: Math.max(maxPoints * 4, maxPoints),
+    const normalized = normalizePerformanceSample(sample);
+    if (!hasSeriesValue(normalized, series)) return;
+    samples = appendPerformanceSample(samples, normalized, {
+      limit: Math.max(1, samples.length + 1),
     });
+    samples = trimToWindow(
+      samples.filter((item) => hasSeriesValue(item, series)),
+      windowMs,
+    );
     requestDraw();
   }
 
