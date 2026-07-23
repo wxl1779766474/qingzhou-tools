@@ -58,6 +58,54 @@ export function parseLogicalCoreCount(text) {
   return parseIntegerValue(text, { minimum: 1, maximum: 1024 });
 }
 
+export function parseCpuOnlineCoreCount(text) {
+  const parsedText = parseTextValue(text);
+  if (!parsedText.ok) return parsedText;
+  const onlineList = parsedText.value.replace(/\s+/gu, "");
+  if (
+    onlineList.length <= 16_384
+    && /^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/u.test(onlineList)
+  ) {
+    const indexes = new Set();
+    const ranges = onlineList.split(",");
+    if (ranges.length <= 1024) {
+      for (const range of ranges) {
+        const [startText, endText = startText] = range.split("-");
+        const start = Number(startText);
+        const end = Number(endText);
+        if (
+          !Number.isSafeInteger(start)
+          || !Number.isSafeInteger(end)
+          || start < 0
+          || end < start
+          || end - start >= 1024
+        ) {
+          return failure("invalid_integer");
+        }
+        for (let index = start; index <= end; index += 1) {
+          indexes.add(index);
+          if (indexes.size > 1024) return failure("invalid_integer");
+        }
+      }
+      if (indexes.size > 0) return success(indexes.size);
+    }
+  }
+  return failure("invalid_cpu_online_list");
+}
+
+export function parseCpuInfoCoreCount(text) {
+  const parsedText = parseTextValue(text);
+  if (!parsedText.ok) return parsedText;
+  const processorIndexes = new Set();
+  for (const match of parsedText.value.matchAll(/^\s*processor\s*:\s*(\d+)\s*$/gimu)) {
+    processorIndexes.add(Number(match[1]));
+    if (processorIndexes.size > 1024) return failure("invalid_cpuinfo");
+  }
+  return processorIndexes.size > 0
+    ? success(processorIndexes.size)
+    : failure("invalid_cpuinfo");
+}
+
 export function parseCurrentUser(text) {
   return parseIntegerValue(text, { minimum: 0, maximum: 9999 });
 }
@@ -236,6 +284,12 @@ function normalizeCpuPercent(rawPercent, { logicalCores, cpuMode, capacityPercen
     return {
       cpuPercent: clamp(rawPercent / logicalCores, 0, 100),
       normalization: "per-core",
+    };
+  }
+  if (mode === "per-core" && Number.isFinite(capacityPercent) && capacityPercent >= 100) {
+    return {
+      cpuPercent: clamp((rawPercent / capacityPercent) * 100, 0, 100),
+      normalization: "capacity",
     };
   }
   return { cpuPercent: null, normalization: "ambiguous" };
