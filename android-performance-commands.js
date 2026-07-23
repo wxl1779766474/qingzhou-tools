@@ -8,6 +8,9 @@ export const ANDROID_COMMAND_IDS = Object.freeze({
   MANUFACTURER: "manufacturer",
   MODEL: "model",
   LOGICAL_CORES: "logical-cores",
+  LOGICAL_CORES_NPROC: "logical-cores-nproc",
+  LOGICAL_CORES_ONLINE: "logical-cores-online",
+  LOGICAL_CORES_CPUINFO: "logical-cores-cpuinfo",
   CURRENT_USER: "current-user",
   DISPLAY_INFO: "display-info",
   FOREGROUND_APP: "foreground-app",
@@ -106,6 +109,12 @@ export function buildAndroidCommand(commandId, args = {}) {
       return ["getprop", "ro.product.model"];
     case ANDROID_COMMAND_IDS.LOGICAL_CORES:
       return ["getconf", "_NPROCESSORS_ONLN"];
+    case ANDROID_COMMAND_IDS.LOGICAL_CORES_NPROC:
+      return ["nproc"];
+    case ANDROID_COMMAND_IDS.LOGICAL_CORES_ONLINE:
+      return ["cat", "/sys/devices/system/cpu/online"];
+    case ANDROID_COMMAND_IDS.LOGICAL_CORES_CPUINFO:
+      return ["cat", "/proc/cpuinfo"];
     case ANDROID_COMMAND_IDS.CURRENT_USER:
       return ["am", "get-current-user"];
     case ANDROID_COMMAND_IDS.DISPLAY_INFO:
