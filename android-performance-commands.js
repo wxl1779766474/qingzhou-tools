@@ -21,6 +21,7 @@ export const ANDROID_COMMAND_IDS = Object.freeze({
   PIDOF: "pidof",
   TOP_HELP: "top-help",
   TOP_STREAM: "top-stream",
+  PROC_CPU_SNAPSHOT: "proc-cpu-snapshot",
   CPUINFO: "cpuinfo",
   MEMINFO: "meminfo",
   GFXINFO_RESET: "gfxinfo-reset",
@@ -138,6 +139,10 @@ export function buildAndroidCommand(commandId, args = {}) {
     case ANDROID_COMMAND_IDS.TOP_STREAM: {
       const pids = validatePidList(args.pids);
       return ["top", "-b", "-d", "1", "-p", pids.join(","), "-o", "PID,%CPU,ARGS"];
+    }
+    case ANDROID_COMMAND_IDS.PROC_CPU_SNAPSHOT: {
+      const pids = validatePidList(args.pids);
+      return ["cat", "/proc/stat", ...pids.map((pid) => `/proc/${pid}/stat`)];
     }
     case ANDROID_COMMAND_IDS.CPUINFO:
       return ["dumpsys", "cpuinfo"];
