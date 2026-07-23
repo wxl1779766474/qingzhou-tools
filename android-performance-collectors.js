@@ -6,6 +6,8 @@ import {
 import {
   computeNetworkDelta,
   parseBattery,
+  parseCpuInfoCoreCount,
+  parseCpuOnlineCoreCount,
   parseCpuInfo,
   parseCurrentUser,
   parseDisplayRefreshRate,
@@ -48,9 +50,17 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 4_000;
 const DEFAULT_MAX_DURATION_MS = 60 * 60 * 1_000;
 const DEFAULT_PROCESS_GRACE_MS = 10_000;
 const DEFAULT_SAMPLE_LIMIT_PER_METRIC = 3_600;
+const DEFAULT_CPU_TOP_WATCHDOG_MS = 3_500;
+const DEFAULT_CPU_TOP_INVALID_BLOCK_LIMIT = 3;
 const TOP_MAX_LINE_CHARS = 64 * 1_024;
 const TOP_MAX_BLOCK_CHARS = 1_000_000;
 const TOP_MAX_BUFFER_CHARS = 1_000_000;
+const LOGICAL_CORE_COMMAND_IDS = Object.freeze([
+  ANDROID_COMMAND_IDS.LOGICAL_CORES,
+  ANDROID_COMMAND_IDS.LOGICAL_CORES_NPROC,
+  ANDROID_COMMAND_IDS.LOGICAL_CORES_ONLINE,
+  ANDROID_COMMAND_IDS.LOGICAL_CORES_CPUINFO,
+]);
 
 function clone(value) {
   if (typeof structuredClone === "function") return structuredClone(value);
@@ -127,6 +137,36 @@ async function inspectField(runner, commandId, args, parser, field, warnings) {
   }
 }
 
+async function discoverLogicalCores(readCommand) {
+  let reason = "logical_cores_unavailable";
+  for (const commandId of LOGICAL_CORE_COMMAND_IDS) {
+    try {
+      const result = commandOutput(await readCommand(commandId));
+      const parsed = commandId === ANDROID_COMMAND_IDS.LOGICAL_CORES_ONLINE
+        ? parseCpuOnlineCoreCount(result.stdout)
+        : commandId === ANDROID_COMMAND_IDS.LOGICAL_CORES_CPUINFO
+          ? parseCpuInfoCoreCount(result.stdout)
+          : parseLogicalCoreCount(result.stdout);
+      if (parsed.ok) return { value: parsed.value, commandId, reason: null };
+      reason = `${commandId}:${parsed.reasonCode}`;
+    } catch (error) {
+      reason = `${commandId}:${errorReason(error)}`;
+    }
+  }
+  return { value: null, commandId: null, reason };
+}
+
+async function inspectLogicalCores(runner, warnings) {
+  const discovered = await discoverLogicalCores((commandId) => (
+    runner.exec(commandId, {}, {
+      timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS,
+      maxBytes: 2_000_000,
+    })
+  ));
+  if (discovered.value === null) warnings.push(`logicalCores:${discovered.reason}`);
+  return discovered.value;
+}
+
 /**
  * Reads non-sensitive device/app metadata without making any capability fatal.
  */
@@ -149,7 +189,7 @@ export async function inspectAndroidDevice(runner) {
       warnings,
     ),
     inspectField(runner, ANDROID_COMMAND_IDS.ANDROID_VERSION, {}, parseTextValue, "androidVersion", warnings),
-    inspectField(runner, ANDROID_COMMAND_IDS.LOGICAL_CORES, {}, parseLogicalCoreCount, "logicalCores", warnings),
+    inspectLogicalCores(runner, warnings),
     inspectField(runner, ANDROID_COMMAND_IDS.CURRENT_USER, {}, parseCurrentUser, "currentUserId", warnings),
     inspectField(runner, ANDROID_COMMAND_IDS.DISPLAY_INFO, {}, parseTextValue, "display", warnings),
     inspectField(runner, ANDROID_COMMAND_IDS.FOREGROUND_APP, {}, parseTextValue, "foregroundApp", warnings),
@@ -494,6 +534,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
   let cpuController = null;
   let cpuGeneration = 0;
   let cpuConsumer = null;
+  let cpuWatchdogTimer = null;
   let missingProcessSince = null;
 
   const elapsed = () => (
@@ -700,7 +741,13 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     }
   };
 
+  const clearCpuWatchdog = () => {
+    if (cpuWatchdogTimer !== null) timing.clearTimeout(cpuWatchdogTimer);
+    cpuWatchdogTimer = null;
+  };
+
   const enableCpuFallback = (reason) => {
+    clearCpuWatchdog();
     const fallback = tasks.find((task) => task.name === "cpu-fallback");
     if (fallback) {
       fallback.enabled = true;
@@ -713,6 +760,34 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     });
   };
 
+  const disableCpuFallback = () => {
+    const fallback = tasks.find((task) => task.name === "cpu-fallback");
+    if (fallback) fallback.enabled = false;
+  };
+
+  const transitionTopToFallback = async (generationState, reason) => {
+    if (
+      generationState.fallbackTriggered
+      || generationState.generation !== cpuGeneration
+      || snapshot.phase !== "running"
+    ) {
+      return;
+    }
+    generationState.fallbackTriggered = true;
+    const stoppedGeneration = generationState.generation + 1;
+    await stopCpuStream();
+    if (snapshot.phase !== "running" || cpuGeneration !== stoppedGeneration) return;
+    enableCpuFallback(reason);
+    armScheduler();
+  };
+
+  const recordInvalidTopBlock = (generationState) => {
+    generationState.invalidBlocks += 1;
+    if (generationState.invalidBlocks >= config.cpuTopInvalidBlockLimit) {
+      void transitionTopToFallback(generationState, "top_invalid_blocks");
+    }
+  };
+
   const processTopBlock = (text, generationState) => {
     if (snapshot.phase !== "running" || generationState.generation !== cpuGeneration) return;
     const parsed = parseTopSnapshot(text, {
@@ -720,7 +795,15 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
       logicalCores: snapshot.device.logicalCores,
       cpuMode: "per-core",
     });
-    if (!parsed.ok || !parsed.value.found) return;
+    if (
+      !parsed.ok
+      || !parsed.value.found
+      || !Number.isFinite(parsed.value.cpuPercent)
+    ) {
+      recordInvalidTopBlock(generationState);
+      return;
+    }
+    generationState.invalidBlocks = 0;
     if (!generationState.hasBaseline) {
       generationState.hasBaseline = true;
       return;
@@ -736,9 +819,13 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
         capacityPercent: parsed.value.capacityPercent,
       },
     );
+    generationState.hasSample = true;
+    clearCpuWatchdog();
+    disableCpuFallback();
   };
 
   const stopCpuStream = async () => {
+    clearCpuWatchdog();
     cpuGeneration += 1;
     cpuController?.abort(new AndroidCommandError("stream_stopped", "CPU 采集流已停止"));
     const handle = cpuHandle;
@@ -781,7 +868,13 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     }
 
     const handle = cpuHandle;
-    const generationState = { generation, hasBaseline: false };
+    const generationState = {
+      generation,
+      hasBaseline: false,
+      hasSample: false,
+      invalidBlocks: 0,
+      fallbackTriggered: false,
+    };
     const decoder = createTopBlockDecoder((block) => processTopBlock(block, generationState));
     let streamFailureReason = null;
     const stderrConsumer = handle?.stderr
@@ -816,6 +909,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
         // Runner cleanup is best effort and may already have run during stop.
       }
       if (generation === cpuGeneration && snapshot.phase === "running") {
+        clearCpuWatchdog();
         if (streamFailureReason || !controller.signal.aborted) {
           enableCpuFallback(streamFailureReason ?? "top_stream_closed");
           armScheduler();
@@ -823,10 +917,17 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
       }
     });
     Promise.resolve(handle?.exited).catch(() => {});
-    const fallback = tasks.find((task) => task.name === "cpu-fallback");
-    if (fallback) fallback.enabled = false;
-    metricSuccess("cpu", "top");
-    emitStatus({ type: "metric", metric: "cpu", state: "supported", reason: null });
+    markMetric("cpu", {
+      state: "probing",
+      source: "top",
+      reason: "top_waiting_for_sample",
+    });
+    cpuWatchdogTimer = timing.setTimeout(() => {
+      cpuWatchdogTimer = null;
+      if (!generationState.hasSample) {
+        void transitionTopToFallback(generationState, "top_first_sample_timeout");
+      }
+    }, config.cpuTopWatchdogMs);
     return true;
   };
 
@@ -983,6 +1084,20 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
             : DEFAULT_SAMPLE_LIMIT_PER_METRIC,
         ),
       ),
+      cpuTopWatchdogMs: positiveDuration(
+        startConfig.cpuTopWatchdogMs,
+        DEFAULT_CPU_TOP_WATCHDOG_MS,
+        { minimum: 10, maximum: 60_000 },
+      ),
+      cpuTopInvalidBlockLimit: Math.max(
+        1,
+        Math.min(
+          100,
+          Number.isSafeInteger(startConfig.cpuTopInvalidBlockLimit)
+            ? startConfig.cpuTopInvalidBlockLimit
+            : DEFAULT_CPU_TOP_INVALID_BLOCK_LIMIT,
+        ),
+      ),
     };
     sessionController = new AbortController();
     const ensurePreparing = () => {
@@ -1000,12 +1115,8 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     if (Number.isFinite(suppliedRefresh) && suppliedRefresh > 0) snapshot.device.refreshRateHz = suppliedRefresh;
 
     if (snapshot.device.logicalCores === null) {
-      try {
-        const parsed = parseLogicalCoreCount((await exec(ANDROID_COMMAND_IDS.LOGICAL_CORES)).stdout);
-        if (parsed.ok) snapshot.device.logicalCores = parsed.value;
-      } catch {
-        // CPU raw values remain available when core normalization is unknown.
-      }
+      const discovered = await discoverLogicalCores((commandId) => exec(commandId));
+      snapshot.device.logicalCores = discovered.value;
       ensurePreparing();
     }
     if (snapshot.device.refreshRateHz === null) {
