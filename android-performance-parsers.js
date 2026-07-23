@@ -1,7 +1,15 @@
-import { validateAndroidPackageName } from "./android-performance-commands.js";
+import {
+  validateAndroidPackageName,
+  validateAndroidPid,
+} from "./android-performance-commands.js";
 
 const NUMBER_PATTERN = "[-+]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)";
 const PACKAGE_IN_TEXT_PATTERN = /([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/gu;
+const ANSI_OSC_PATTERN =
+  /\u001B\](?:[^\u0007\u001B]|\u001B(?!\\))*(?:\u0007|\u001B\\)/gu;
+const ANSI_CSI_PATTERN = /(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/gu;
+const ANSI_ESCAPE_PATTERN = /\u001B[@-_]/gu;
+const MAX_PROC_PID_COUNT = 128;
 const THERMAL_STATUS_NAMES = Object.freeze([
   "NONE",
   "LIGHT",
@@ -214,6 +222,32 @@ function splitColumns(line) {
   return line.trim().split(/\s+/u);
 }
 
+function stripAnsiControlSequences(value) {
+  return value
+    .replace(ANSI_OSC_PATTERN, "")
+    .replace(ANSI_CSI_PATTERN, "")
+    .replace(ANSI_ESCAPE_PATTERN, "");
+}
+
+function normalizeTopText(text) {
+  return stripAnsiControlSequences(text).replace(/\r\n?|\n/gu, "\n");
+}
+
+function splitTopHeaderColumns(line) {
+  return splitColumns(
+    stripAnsiControlSequences(line)
+      .replace(/\r/gu, "")
+      .replace(/[\[\]]/gu, " "),
+  );
+}
+
+export function isTopHeaderLine(line) {
+  if (typeof line !== "string") return false;
+  const fields = splitTopHeaderColumns(line).map((field) => field.toUpperCase());
+  return fields.includes("PID")
+    && fields.some((field) => field === "%CPU" || field === "CPU%");
+}
+
 export function parseProcessList(text, { packageName, uid = undefined } = {}) {
   if (typeof text !== "string" || text.trim() === "") return failure("empty_output");
   const targetPackage = validPackageName(packageName);
@@ -296,13 +330,11 @@ function normalizeCpuPercent(rawPercent, { logicalCores, cpuMode, capacityPercen
 }
 
 function parseTopBlock(lines, options, capacityPercent) {
-  const headerIndex = lines.findIndex((line) => {
-    const fields = splitColumns(line).map((field) => field.toUpperCase());
-    return fields.includes("PID") && fields.some((field) => field === "%CPU" || field === "CPU%");
-  });
+  const headerIndex = lines.findIndex(isTopHeaderLine);
   if (headerIndex < 0) return null;
 
-  const headers = splitColumns(lines[headerIndex]).map((field) => field.toUpperCase());
+  const headers = splitTopHeaderColumns(lines[headerIndex])
+    .map((field) => field.toUpperCase());
   const pidIndex = headers.indexOf("PID");
   const cpuIndex = headers.findIndex((field) => field === "%CPU" || field === "CPU%");
   const targetPids = options.targetPids ? new Set(options.targetPids.map(Number)) : null;
@@ -336,7 +368,7 @@ function parseTopBlock(lines, options, capacityPercent) {
 
 export function parseTopSnapshots(text, options = {}) {
   if (typeof text !== "string" || text.trim() === "") return failure("empty_output");
-  const lines = text.split(/\r?\n/u);
+  const lines = normalizeTopText(text).split("\n");
   const blocks = [];
   let current = [];
   let capacityPercent = null;
@@ -353,14 +385,11 @@ export function parseTopSnapshots(text, options = {}) {
   for (const line of lines) {
     const capacityMatch = line.match(/\b(\d+)%cpu\b/iu);
     if (capacityMatch) capacityPercent = Number(capacityMatch[1]);
-    const isHeader = (() => {
-      const fields = splitColumns(line).map((field) => field.toUpperCase());
-      return fields.includes("PID") && fields.some((field) => field === "%CPU" || field === "CPU%");
-    })();
-    if (isHeader && current.some((entry) => /\bPID\b/u.test(entry))) flush();
+    const isHeader = isTopHeaderLine(line);
+    if (isHeader && current.some(isTopHeaderLine)) flush();
     if (current.length === 0) currentCapacity = capacityPercent;
     current.push(line);
-    if (line.trim() === "" && current.some((entry) => /(?:%CPU|CPU%)/u.test(entry))) flush();
+    if (line.trim() === "" && current.some(isTopHeaderLine)) flush();
   }
   flush();
 
@@ -371,6 +400,225 @@ export function parseTopSnapshot(text, options = {}) {
   const parsed = parseTopSnapshots(text, options);
   if (!parsed.ok) return parsed;
   return success(parsed.value.at(-1), { source: "top" });
+}
+
+function normalizeProcTargetPids(targetPids) {
+  if (!Array.isArray(targetPids) || targetPids.length === 0
+    || targetPids.length > MAX_PROC_PID_COUNT) {
+    return null;
+  }
+  try {
+    return [...new Set(targetPids.map(validateAndroidPid))].sort((a, b) => a - b);
+  } catch {
+    return null;
+  }
+}
+
+function parseUnsignedSafeInteger(value) {
+  if (typeof value !== "string" || !/^\d+$/u.test(value)) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) ? number : null;
+}
+
+function parseProcSystemStatLine(line) {
+  const fields = splitColumns(line);
+  const counterFields = fields.slice(1);
+  if (fields[0] !== "cpu" || counterFields.length < 8 || counterFields.length > 10) {
+    return null;
+  }
+  const values = counterFields.map(parseUnsignedSafeInteger);
+  if (values.some((value) => value === null)) return null;
+  const totalTicks = values.slice(0, 8).reduce((total, value) => total + value, 0);
+  return Number.isSafeInteger(totalTicks) && totalTicks > 0 ? totalTicks : null;
+}
+
+function parseProcProcessStatLine(line) {
+  const match = line.match(/^\s*(\d+)\s+\((.*)\)\s+([A-Za-z])\s+(.+?)\s*$/u);
+  if (!match) return null;
+  let pid;
+  try {
+    pid = validateAndroidPid(match[1]);
+  } catch {
+    return null;
+  }
+
+  const trailingFields = match[4].split(/\s+/u);
+  if (trailingFields.length < 19) return null;
+  const utimeTicks = parseUnsignedSafeInteger(trailingFields[10]);
+  const stimeTicks = parseUnsignedSafeInteger(trailingFields[11]);
+  const starttimeTicks = parseUnsignedSafeInteger(trailingFields[18]);
+  if (utimeTicks === null || stimeTicks === null || starttimeTicks === null) return null;
+  const processTicks = utimeTicks + stimeTicks;
+  if (!Number.isSafeInteger(processTicks)) return null;
+
+  return {
+    pid,
+    name: match[2],
+    state: match[3],
+    utimeTicks,
+    stimeTicks,
+    processTicks,
+    starttimeTicks,
+  };
+}
+
+export function parseProcCpuSnapshot(text, { targetPids } = {}) {
+  if (typeof text !== "string" || text.trim() === "") return failure("empty_output");
+  const normalizedTargetPids = normalizeProcTargetPids(targetPids);
+  if (!normalizedTargetPids) {
+    return failure("invalid_pid_list", { retryable: false });
+  }
+
+  const targetSet = new Set(normalizedTargetPids);
+  const processesByPid = new Map();
+  let systemTotalTicks = null;
+  let systemStatLineCount = 0;
+  for (const line of text.split(/\r\n?|\n/u)) {
+    if (/^\s*cpu(?:\s|$)/u.test(line)) {
+      systemStatLineCount += 1;
+      if (systemStatLineCount === 1) systemTotalTicks = parseProcSystemStatLine(line);
+      continue;
+    }
+    const process = parseProcProcessStatLine(line);
+    if (!process || !targetSet.has(process.pid) || processesByPid.has(process.pid)) continue;
+    processesByPid.set(process.pid, process);
+  }
+
+  if (systemStatLineCount === 0) return failure("proc_stat_unavailable");
+  if (systemStatLineCount !== 1 || systemTotalTicks === null) {
+    return failure("proc_stat_invalid");
+  }
+  const processes = [...processesByPid.values()].sort((a, b) => a.pid - b.pid);
+  if (processes.length === 0) return failure("proc_process_stats_unavailable");
+  const foundPids = new Set(processes.map((process) => process.pid));
+  const missingPids = normalizedTargetPids.filter((pid) => !foundPids.has(pid));
+  const partial = missingPids.length > 0;
+
+  return success(
+    {
+      systemTotalTicks,
+      processes,
+      targetPids: normalizedTargetPids,
+      missingPids,
+      partial,
+    },
+    {
+      warnings: partial ? ["proc_process_partial"] : [],
+      source: "proc",
+    },
+  );
+}
+
+function isValidProcCpuSnapshot(snapshot) {
+  if (
+    !snapshot
+    || !Number.isSafeInteger(snapshot.systemTotalTicks)
+    || snapshot.systemTotalTicks <= 0
+    || !Array.isArray(snapshot.processes)
+    || snapshot.processes.length === 0
+  ) {
+    return false;
+  }
+  const seenPids = new Set();
+  return snapshot.processes.every((process) => {
+    if (
+      !Number.isSafeInteger(process?.pid)
+      || process.pid <= 0
+      || seenPids.has(process.pid)
+      || !Number.isSafeInteger(process.starttimeTicks)
+      || process.starttimeTicks < 0
+      || !Number.isSafeInteger(process.processTicks)
+      || process.processTicks < 0
+    ) {
+      return false;
+    }
+    seenPids.add(process.pid);
+    return true;
+  });
+}
+
+export function computeProcCpuDelta(previous, current) {
+  if (!isValidProcCpuSnapshot(current)) {
+    return failure("invalid_proc_snapshot", { retryable: false });
+  }
+  if (previous === null || previous === undefined) {
+    return success(
+      {
+        baseline: true,
+        cpuPercent: null,
+        rawPercent: null,
+        normalization: "device",
+        processDeltaTicks: null,
+        systemDeltaTicks: null,
+        matchedPids: [],
+        skippedPids: [],
+        partial: Boolean(current.partial),
+      },
+      { source: "proc" },
+    );
+  }
+  if (!isValidProcCpuSnapshot(previous)) {
+    return failure("invalid_proc_baseline", { retryable: false });
+  }
+
+  const systemDeltaTicks = current.systemTotalTicks - previous.systemTotalTicks;
+  if (!Number.isSafeInteger(systemDeltaTicks) || systemDeltaTicks <= 0) {
+    return failure("proc_counter_reset");
+  }
+
+  const previousByPid = new Map(
+    previous.processes.map((process) => [process.pid, process]),
+  );
+  const matchedPids = [];
+  const skippedPids = [];
+  let regressed = false;
+  let processDeltaTicks = 0;
+
+  for (const process of current.processes) {
+    const baseline = previousByPid.get(process.pid);
+    if (!baseline || baseline.starttimeTicks !== process.starttimeTicks) {
+      skippedPids.push(process.pid);
+      continue;
+    }
+    const deltaTicks = process.processTicks - baseline.processTicks;
+    if (!Number.isSafeInteger(deltaTicks) || deltaTicks < 0) {
+      regressed = true;
+      skippedPids.push(process.pid);
+      continue;
+    }
+    processDeltaTicks += deltaTicks;
+    if (!Number.isSafeInteger(processDeltaTicks)) {
+      return failure("proc_counter_reset");
+    }
+    matchedPids.push(process.pid);
+  }
+
+  if (matchedPids.length === 0) {
+    return failure(regressed ? "proc_counter_reset" : "proc_process_delta_unavailable");
+  }
+  const partial = Boolean(
+    previous.partial
+    || current.partial
+    || skippedPids.length > 0,
+  );
+  const cpuPercent = clamp((processDeltaTicks / systemDeltaTicks) * 100, 0, 100);
+  return success(
+    {
+      baseline: false,
+      cpuPercent,
+      rawPercent: cpuPercent,
+      normalization: "device",
+      processDeltaTicks,
+      systemDeltaTicks,
+      matchedPids,
+      skippedPids,
+      partial,
+    },
+    {
+      warnings: partial ? ["proc_process_partial"] : [],
+      source: "proc",
+    },
+  );
 }
 
 export function parseCpuInfo(text, { targetPids = undefined, logicalCores = undefined } = {}) {
