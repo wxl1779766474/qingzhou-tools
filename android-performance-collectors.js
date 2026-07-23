@@ -4,7 +4,9 @@ import {
   validateAndroidPackageName,
 } from "./android-performance-commands.js";
 import {
+  computeProcCpuDelta,
   computeNetworkDelta,
+  isTopHeaderLine,
   parseBattery,
   parseCpuInfoCoreCount,
   parseCpuOnlineCoreCount,
@@ -20,6 +22,7 @@ import {
   parseNetstats,
   parsePackageInfo,
   parsePidof,
+  parseProcCpuSnapshot,
   parseProcessList,
   parseTextValue,
   parseThermalStatus,
@@ -44,6 +47,7 @@ const DEFAULT_INTERVALS = Object.freeze({
   batteryMs: 5_000,
   thermalMs: 5_000,
   processMs: 5_000,
+  cpuProcMs: 1_000,
   cpuFallbackMs: 5_000,
 });
 const DEFAULT_COMMAND_TIMEOUT_MS = 4_000;
@@ -52,6 +56,7 @@ const DEFAULT_PROCESS_GRACE_MS = 10_000;
 const DEFAULT_SAMPLE_LIMIT_PER_METRIC = 3_600;
 const DEFAULT_CPU_TOP_WATCHDOG_MS = 3_500;
 const DEFAULT_CPU_TOP_INVALID_BLOCK_LIMIT = 3;
+const DEFAULT_CPU_PROC_FAILURE_LIMIT = 3;
 const DEFAULT_CPU_STREAM_CLEANUP_MS = 500;
 const TOP_MAX_LINE_CHARS = 64 * 1_024;
 const TOP_MAX_BLOCK_CHARS = 1_000_000;
@@ -311,6 +316,7 @@ function normalizeIntervals(config) {
     batteryMs: positiveDuration(read("batteryMs"), DEFAULT_INTERVALS.batteryMs),
     thermalMs: positiveDuration(read("thermalMs"), DEFAULT_INTERVALS.thermalMs),
     processMs: positiveDuration(read("processMs"), DEFAULT_INTERVALS.processMs),
+    cpuProcMs: positiveDuration(read("cpuProcMs"), DEFAULT_INTERVALS.cpuProcMs),
     cpuFallbackMs: positiveDuration(read("cpuFallbackMs"), DEFAULT_INTERVALS.cpuFallbackMs),
   };
 }
@@ -461,11 +467,6 @@ async function* textChunks(source, signal) {
   throw new AndroidCommandError("streaming_unsupported", "ADB 流不是可读取的标准流");
 }
 
-function isTopHeader(line) {
-  const fields = line.trim().split(/\s+/u).map((field) => field.toUpperCase());
-  return fields.includes("PID") && fields.some((field) => field === "%CPU" || field === "CPU%");
-}
-
 function createTopBlockDecoder(onBlock) {
   let partial = "";
   let lines = [];
@@ -492,24 +493,39 @@ function createTopBlockDecoder(onBlock) {
 
   const addLine = (line) => {
     if (line.length > TOP_MAX_LINE_CHARS) failTooLarge("单行");
-    if (isTopHeader(line) && hasHeader) flush();
+    if (isTopHeaderLine(line) && hasHeader) flush();
     blockChars += line.length + 1;
     if (blockChars > TOP_MAX_BLOCK_CHARS) failTooLarge("采样块");
     lines.push(line);
-    if (isTopHeader(line)) hasHeader = true;
+    if (isTopHeaderLine(line)) hasHeader = true;
     if (line.trim() === "" && hasHeader) flush();
+  };
+
+  const drainLines = (final = false) => {
+    let start = 0;
+    for (let index = 0; index < partial.length; index += 1) {
+      const character = partial[index];
+      if (character !== "\r" && character !== "\n") continue;
+      if (character === "\r" && index === partial.length - 1 && !final) break;
+      addLine(partial.slice(start, index));
+      if (character === "\r" && partial[index + 1] === "\n") index += 1;
+      start = index + 1;
+    }
+    partial = partial.slice(start);
+    if (final && partial) {
+      addLine(partial);
+      partial = "";
+    }
   };
 
   return {
     push(chunk) {
       if (partial.length + chunk.length > TOP_MAX_BUFFER_CHARS) failTooLarge("缓冲区");
       partial += chunk;
-      const complete = partial.split(/\r?\n/u);
-      partial = complete.pop() ?? "";
-      for (const line of complete) addLine(line);
+      drainLines();
     },
     finish() {
-      if (partial) addLine(partial);
+      drainLines(true);
       flush();
       partial = "";
     },
@@ -586,6 +602,10 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
   let cpuGeneration = 0;
   let cpuConsumer = null;
   let cpuWatchdogTimer = null;
+  let cpuStrategy = "top";
+  let cpuTopFallbackReason = null;
+  let cpuProcBaseline = null;
+  let cpuProcFailures = 0;
   let missingProcessSince = null;
 
   const elapsed = () => (
@@ -795,13 +815,35 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     }
   };
 
-  const collectCpuFallback = async () => {
+  const cpuTask = (name) => tasks.find((task) => task.name === name);
+
+  const disableCpuInfoFallback = () => {
+    const fallback = cpuTask("cpuinfo-fallback");
+    if (fallback) fallback.enabled = false;
+  };
+
+  const enableCpuInfoFallback = (reason) => {
+    const fallback = cpuTask("cpuinfo-fallback");
+    if (fallback) {
+      fallback.enabled = true;
+      fallback.nextDue = Math.min(fallback.nextDue, timing.now());
+    }
+    const procTask = cpuTask("cpu-proc");
+    if (procTask) procTask.intervalMs = intervals.cpuFallbackMs;
+    cpuStrategy = "cpuinfo";
+    markMetric("cpu", {
+      state: "degraded",
+      source: "cpuinfo",
+      reason,
+    });
+    armScheduler();
+  };
+
+  const collectCpuInfoFallback = async () => {
     if (!taskEnabled("cpu") || snapshot.target.pids.length === 0) return;
-    const generation = cpuGeneration;
-    const fallbackTask = tasks.find((task) => task.name === "cpu-fallback");
+    const fallbackTask = cpuTask("cpuinfo-fallback");
     const isCurrentFallback = () => (
       snapshot.phase === "running"
-      && generation === cpuGeneration
       && Boolean(fallbackTask?.enabled)
     );
     try {
@@ -812,7 +854,11 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
         logicalCores: snapshot.device.logicalCores,
       });
       if (!parsed.ok || !parsed.value.found) {
-        metricFailure("cpu", parsed.reasonCode ?? "target_not_in_cpuinfo");
+        metricFailure(
+          "cpu",
+          parsed.reasonCode ?? "target_not_in_cpuinfo",
+          { allowPause: false },
+        );
         return;
       }
       appendSample(
@@ -828,7 +874,71 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
         isCurrentFallback()
         && !isAbortError(error, sessionController?.signal)
       ) {
-        metricFailure("cpu", errorReason(error));
+        metricFailure("cpu", errorReason(error), { allowPause: false });
+      }
+    }
+  };
+
+  const recordCpuProcFailure = (reason, { resetBaseline = true } = {}) => {
+    cpuProcFailures += 1;
+    if (resetBaseline) cpuProcBaseline = null;
+    metricFailure("cpu", reason, { allowPause: false });
+    if (cpuProcFailures >= config.cpuProcFailureLimit) {
+      enableCpuInfoFallback(reason);
+    }
+  };
+
+  const collectCpuProc = async () => {
+    if (!taskEnabled("cpu") || snapshot.target.pids.length === 0) return;
+    const procTask = cpuTask("cpu-proc");
+    const isCurrentProc = () => (
+      snapshot.phase === "running"
+      && Boolean(procTask?.enabled)
+    );
+    try {
+      const result = await exec(
+        ANDROID_COMMAND_IDS.PROC_CPU_SNAPSHOT,
+        { pids: snapshot.target.pids },
+      );
+      if (!isCurrentProc()) return;
+      const parsed = parseProcCpuSnapshot(result.stdout, {
+        targetPids: snapshot.target.pids,
+      });
+      if (!parsed.ok) {
+        recordCpuProcFailure(parsed.reasonCode);
+        return;
+      }
+
+      const delta = computeProcCpuDelta(cpuProcBaseline, parsed.value);
+      cpuProcBaseline = parsed.value;
+      if (!delta.ok) {
+        recordCpuProcFailure(delta.reasonCode, { resetBaseline: false });
+        return;
+      }
+
+      cpuProcFailures = 0;
+      if (procTask) procTask.intervalMs = intervals.cpuProcMs;
+      if (delta.value.baseline) return;
+
+      disableCpuInfoFallback();
+      cpuStrategy = "proc";
+      snapshot.metrics.cpu.reason = cpuTopFallbackReason;
+      appendSample(
+        "cpu",
+        "proc",
+        delta.value,
+        result.durationMs,
+        {
+          pids: delta.value.matchedPids,
+          skippedPids: delta.value.skippedPids,
+          normalization: "device",
+          partial: delta.value.partial,
+        },
+        { degraded: true },
+      );
+    } catch (error) {
+      if (isCurrentProc() && !isAbortError(error, sessionController?.signal)) {
+        recordCpuProcFailure(errorReason(error, "proc_stat_unavailable"));
       }
     }
   };
@@ -838,23 +948,34 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     cpuWatchdogTimer = null;
   };
 
-  const enableCpuFallback = (reason) => {
+  const enableCpuProc = (reason) => {
     clearCpuWatchdog();
-    const fallback = tasks.find((task) => task.name === "cpu-fallback");
-    if (fallback) {
-      fallback.enabled = true;
-      fallback.nextDue = Math.min(fallback.nextDue, timing.now());
+    cpuProcBaseline = null;
+    cpuProcFailures = 0;
+    const procTask = cpuTask("cpu-proc");
+    if (procTask) {
+      procTask.enabled = true;
+      procTask.intervalMs = intervals.cpuProcMs;
+      procTask.nextDue = Math.min(procTask.nextDue, timing.now());
     }
+    disableCpuInfoFallback();
+    cpuStrategy = "proc";
+    cpuTopFallbackReason = reason;
     markMetric("cpu", {
       state: "degraded",
-      source: "cpuinfo",
+      source: "proc",
       reason,
     });
+    armScheduler();
   };
 
-  const disableCpuFallback = () => {
-    const fallback = tasks.find((task) => task.name === "cpu-fallback");
-    if (fallback) fallback.enabled = false;
+  const disableCpuFallbacks = () => {
+    const procTask = cpuTask("cpu-proc");
+    if (procTask) procTask.enabled = false;
+    disableCpuInfoFallback();
+    cpuTopFallbackReason = null;
+    cpuProcBaseline = null;
+    cpuProcFailures = 0;
   };
 
   const transitionTopToFallback = (generationState, reason) => {
@@ -866,8 +987,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
       return;
     }
     generationState.fallbackTriggered = true;
-    enableCpuFallback(reason);
-    armScheduler();
+    enableCpuProc(reason);
     void stopCpuStream();
   };
 
@@ -898,6 +1018,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
       generationState.hasBaseline = true;
       return;
     }
+    cpuStrategy = "top";
     appendSample(
       "cpu",
       "top",
@@ -911,7 +1032,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     );
     generationState.hasSample = true;
     clearCpuWatchdog();
-    disableCpuFallback();
+    disableCpuFallbacks();
   };
 
   const stopCpuStream = async () => {
@@ -931,7 +1052,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
 
   const startCpuStream = async () => {
     if (typeof runner.open !== "function" || snapshot.target.pids.length === 0) {
-      enableCpuFallback("top_stream_unavailable");
+      enableCpuProc("top_stream_unavailable");
       return false;
     }
 
@@ -985,7 +1106,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
       void openPromise.then((lateHandle) => closeCpuHandle(lateHandle), () => {});
       if (cpuController === controller) cpuController = null;
       if (generation === cpuGeneration && snapshot.phase === "running") {
-        enableCpuFallback(errorReason(error, "top_stream_unavailable"));
+        enableCpuProc(errorReason(error, "top_stream_unavailable"));
       }
       return false;
     } finally {
@@ -1037,12 +1158,12 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
       if (generation === cpuGeneration && snapshot.phase === "running") {
         clearCpuWatchdog();
         if (streamFailureReason || !controller.signal.aborted) {
-          enableCpuFallback(streamFailureReason ?? "top_stream_closed");
-          armScheduler();
+          enableCpuProc(streamFailureReason ?? "top_stream_closed");
         }
       }
     });
     Promise.resolve(handle?.exited).catch(() => {});
+    cpuStrategy = "top";
     markMetric("cpu", {
       state: "probing",
       source: "top",
@@ -1080,7 +1201,19 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     if (!samePidList(snapshot.target.pids, found.pids)) {
       snapshot.target.pids = found.pids;
       emitStatus({ type: "target", pids: [...found.pids] });
-      await startCpuStream();
+      if (cpuStrategy === "top") {
+        await startCpuStream();
+      } else {
+        cpuProcBaseline = null;
+        cpuProcFailures = 0;
+        const procTask = cpuTask("cpu-proc");
+        if (procTask) {
+          procTask.enabled = true;
+          procTask.intervalMs = intervals.cpuProcMs;
+          procTask.nextDue = Math.min(procTask.nextDue, timing.now());
+        }
+        armScheduler();
+      }
     }
   };
 
@@ -1114,7 +1247,8 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
         if (due.length === 0) break;
 
         for (const task of due) {
-          if (snapshot.phase !== "running" || !task.enabled) break;
+          if (snapshot.phase !== "running") break;
+          if (!task.enabled) continue;
           if (task.oneShot) task.enabled = false;
           try {
             await task.run();
@@ -1224,6 +1358,15 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
             : DEFAULT_CPU_TOP_INVALID_BLOCK_LIMIT,
         ),
       ),
+      cpuProcFailureLimit: Math.max(
+        1,
+        Math.min(
+          100,
+          Number.isSafeInteger(startConfig.cpuProcFailureLimit)
+            ? startConfig.cpuProcFailureLimit
+            : DEFAULT_CPU_PROC_FAILURE_LIMIT,
+        ),
+      ),
       cpuStreamCleanupMs: positiveDuration(
         startConfig.cpuStreamCleanupMs,
         DEFAULT_CPU_STREAM_CLEANUP_MS,
@@ -1316,7 +1459,15 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     addTask("battery", intervals.batteryMs, Math.min(500, intervals.batteryMs), 40, collectBattery);
     addTask("thermal", intervals.thermalMs, Math.min(750, intervals.thermalMs), 50, collectThermal);
     addTask("process", intervals.processMs, intervals.processMs, 10, refreshProcesses);
-    addTask("cpu-fallback", intervals.cpuFallbackMs, intervals.cpuFallbackMs, 15, collectCpuFallback, false);
+    addTask("cpu-proc", intervals.cpuProcMs, intervals.cpuProcMs, 14, collectCpuProc, false);
+    addTask(
+      "cpuinfo-fallback",
+      intervals.cpuFallbackMs,
+      intervals.cpuFallbackMs,
+      15,
+      collectCpuInfoFallback,
+      false,
+    );
     tasks.push({
       name: "auto-stop",
       intervalMs: config.maxDurationMs,
