@@ -333,29 +333,35 @@ export function createPerformanceChart(canvas, options = {}) {
     }
 
     for (const item of series) {
+      const seriesPoints = points
+        .filter((sample) => Number.isFinite(sample[item.key]))
+        .map((sample) => {
+          const value = sample[item.key];
+          return {
+            x: padding.left + ((sample.timestamp - startedAt) / duration) * plotWidth,
+            y: padding.top + ((maximum - value) / range) * plotHeight,
+          };
+        });
+      if (!seriesPoints.length) continue;
+
       context.beginPath();
       context.strokeStyle = item.color;
       context.lineWidth = 2;
       context.lineJoin = "round";
       context.lineCap = "round";
-      let segmentOpen = false;
-      for (let index = 0; index < points.length; index += 1) {
-        const sample = points[index];
-        const value = sample[item.key];
-        if (value === null || !Number.isFinite(value)) {
-          segmentOpen = false;
-          continue;
-        }
-        const x = padding.left + ((sample.timestamp - startedAt) / duration) * plotWidth;
-        const y = padding.top + ((maximum - value) / range) * plotHeight;
-        if (!segmentOpen) {
-          context.moveTo(x, y);
-          segmentOpen = true;
-        } else {
-          context.lineTo(x, y);
-        }
+      context.moveTo(seriesPoints[0].x, seriesPoints[0].y);
+      for (const point of seriesPoints.slice(1)) {
+        context.lineTo(point.x, point.y);
       }
       context.stroke();
+
+      context.beginPath();
+      context.fillStyle = item.color;
+      for (const point of seriesPoints) {
+        context.moveTo(point.x + 2.5, point.y);
+        context.arc(point.x, point.y, 2.5, 0, Math.PI * 2);
+      }
+      context.fill();
     }
 
     const accessibleSummary = series.map((item) => {
