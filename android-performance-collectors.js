@@ -52,9 +52,11 @@ const DEFAULT_PROCESS_GRACE_MS = 10_000;
 const DEFAULT_SAMPLE_LIMIT_PER_METRIC = 3_600;
 const DEFAULT_CPU_TOP_WATCHDOG_MS = 3_500;
 const DEFAULT_CPU_TOP_INVALID_BLOCK_LIMIT = 3;
+const DEFAULT_CPU_STREAM_CLEANUP_MS = 500;
 const TOP_MAX_LINE_CHARS = 64 * 1_024;
 const TOP_MAX_BLOCK_CHARS = 1_000_000;
 const TOP_MAX_BUFFER_CHARS = 1_000_000;
+const STREAM_ABORTED = Symbol("stream-aborted");
 const LOGICAL_CORE_COMMAND_IDS = Object.freeze([
   ANDROID_COMMAND_IDS.LOGICAL_CORES,
   ANDROID_COMMAND_IDS.LOGICAL_CORES_NPROC,
@@ -372,8 +374,8 @@ function streamSource(handle) {
   return handle?.stdout ?? handle?.readable ?? handle;
 }
 
-async function* textChunks(source) {
-  if (!source) return;
+async function* textChunks(source, signal) {
+  if (!source || signal?.aborted) return;
   if (typeof source === "string") {
     yield source;
     return;
@@ -382,27 +384,76 @@ async function* textChunks(source) {
   const decoder = new TextDecoder();
   if (typeof source.getReader === "function") {
     const reader = source.getReader();
+    let resolveAbort;
+    let aborted = false;
+    const abortPromise = new Promise((resolve) => {
+      resolveAbort = resolve;
+    });
+    const abort = () => {
+      aborted = true;
+      resolveAbort(STREAM_ABORTED);
+      try {
+        void Promise.resolve(reader.cancel(signal?.reason)).catch(() => {});
+      } catch {
+        // A locked or already closed reader is already leaving the consume loop.
+      }
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     try {
-      while (true) {
-        const { value, done } = await reader.read();
+      while (!aborted) {
+        const result = await Promise.race([reader.read(), abortPromise]);
+        if (result === STREAM_ABORTED) break;
+        const { value, done } = result;
         if (done) break;
         if (typeof value === "string") yield value;
         else yield decoder.decode(value, { stream: true });
       }
-      const tail = decoder.decode();
+      const tail = aborted ? "" : decoder.decode();
       if (tail) yield tail;
     } finally {
-      reader.releaseLock?.();
+      signal?.removeEventListener("abort", abort);
+      try {
+        reader.releaseLock?.();
+      } catch {
+        // A pending read may retain the lock until the detached cancel settles.
+      }
     }
     return;
   }
 
   if (typeof source[Symbol.asyncIterator] === "function") {
-    for await (const value of source) {
-      if (typeof value === "string") yield value;
-      else if (value !== undefined && value !== null) yield decoder.decode(value, { stream: true });
+    const iterator = source[Symbol.asyncIterator]();
+    let resolveAbort;
+    let returnPromise = null;
+    let aborted = false;
+    const abortPromise = new Promise((resolve) => {
+      resolveAbort = resolve;
+    });
+    const abort = () => {
+      aborted = true;
+      resolveAbort(STREAM_ABORTED);
+      try {
+        returnPromise = Promise.resolve(iterator.return?.()).catch(() => {});
+      } catch {
+        // Iterator cleanup is best effort; generation guards ignore late data.
+      }
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    try {
+      while (!aborted) {
+        const result = await Promise.race([Promise.resolve(iterator.next()), abortPromise]);
+        if (result === STREAM_ABORTED || result.done) break;
+        const value = result.value;
+        if (typeof value === "string") yield value;
+        else if (value !== undefined && value !== null) yield decoder.decode(value, { stream: true });
+      }
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      if (returnPromise) await returnPromise;
     }
-    const tail = decoder.decode();
+    const tail = aborted ? "" : decoder.decode();
     if (tail) yield tail;
     return;
   }
@@ -551,6 +602,34 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
   const emitStatus = (event) => {
     safeCallback(onStatus, { ...event, snapshot: getSnapshot() });
   };
+
+  const closeCpuHandle = (handle) => {
+    try {
+      handle?.__androidRunnerCleanup?.();
+    } catch {
+      // Linked abort cleanup is best effort and idempotent.
+    }
+    try {
+      return Promise.resolve(handle?.kill?.()).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
+  };
+
+  const waitForCpuCleanup = (promise) => new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      timing.clearTimeout(timeoutId);
+      resolve();
+    };
+    const timeoutId = timing.setTimeout(
+      finish,
+      config?.cpuStreamCleanupMs ?? DEFAULT_CPU_STREAM_CLEANUP_MS,
+    );
+    Promise.resolve(promise).then(finish, finish);
+  });
 
   const markMetric = (metric, patch) => {
     Object.assign(snapshot.metrics[metric], patch);
@@ -718,8 +797,16 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
 
   const collectCpuFallback = async () => {
     if (!taskEnabled("cpu") || snapshot.target.pids.length === 0) return;
+    const generation = cpuGeneration;
+    const fallbackTask = tasks.find((task) => task.name === "cpu-fallback");
+    const isCurrentFallback = () => (
+      snapshot.phase === "running"
+      && generation === cpuGeneration
+      && Boolean(fallbackTask?.enabled)
+    );
     try {
       const result = await exec(ANDROID_COMMAND_IDS.CPUINFO);
+      if (!isCurrentFallback()) return;
       const parsed = parseCpuInfo(result.stdout, {
         targetPids: snapshot.target.pids,
         logicalCores: snapshot.device.logicalCores,
@@ -737,7 +824,12 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
         { degraded: true },
       );
     } catch (error) {
-      if (!isAbortError(error, sessionController?.signal)) metricFailure("cpu", errorReason(error));
+      if (
+        isCurrentFallback()
+        && !isAbortError(error, sessionController?.signal)
+      ) {
+        metricFailure("cpu", errorReason(error));
+      }
     }
   };
 
@@ -765,7 +857,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     if (fallback) fallback.enabled = false;
   };
 
-  const transitionTopToFallback = async (generationState, reason) => {
+  const transitionTopToFallback = (generationState, reason) => {
     if (
       generationState.fallbackTriggered
       || generationState.generation !== cpuGeneration
@@ -774,11 +866,9 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
       return;
     }
     generationState.fallbackTriggered = true;
-    const stoppedGeneration = generationState.generation + 1;
-    await stopCpuStream();
-    if (snapshot.phase !== "running" || cpuGeneration !== stoppedGeneration) return;
     enableCpuFallback(reason);
     armScheduler();
+    void stopCpuStream();
   };
 
   const recordInvalidTopBlock = (generationState) => {
@@ -832,18 +922,11 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     const consumer = cpuConsumer;
     cpuHandle = null;
     cpuController = null;
-    try {
-      await handle?.kill?.();
-    } catch {
-      // A closed transport is already the desired state.
-    }
-    try {
-      handle?.__androidRunnerCleanup?.();
-    } catch {
-      // Cleanup is best effort and idempotent.
-    }
-    if (consumer) await consumer;
     if (cpuConsumer === consumer) cpuConsumer = null;
+    await waitForCpuCleanup(Promise.allSettled([
+      closeCpuHandle(handle),
+      consumer ?? Promise.resolve(),
+    ]));
   };
 
   const startCpuStream = async () => {
@@ -853,18 +936,61 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     }
 
     await stopCpuStream();
+    if (snapshot.phase !== "running" || sessionController?.signal.aborted) {
+      return false;
+    }
     const generation = cpuGeneration;
     const controller = new AbortController();
     cpuController = controller;
-    try {
-      cpuHandle = await runner.open(
-        ANDROID_COMMAND_IDS.TOP_STREAM,
-        { pids: snapshot.target.pids },
-        { signal: controller.signal, maxBytes: 4_000_000 },
+    const openPromise = Promise.resolve().then(() => runner.open(
+      ANDROID_COMMAND_IDS.TOP_STREAM,
+      { pids: snapshot.target.pids },
+      {
+        signal: controller.signal,
+        timeoutMs: config.commandTimeoutMs,
+        maxBytes: 4_000_000,
+      },
+    ));
+    let openTimeoutId = null;
+    let removeOpenAbort = () => {};
+    const cancelledOpen = new Promise((_resolve, reject) => {
+      const abort = () => reject(
+        controller.signal.reason
+          ?? new AndroidCommandError("top_stream_open_cancelled", "CPU 采集流启动已取消"),
       );
+      if (controller.signal.aborted) abort();
+      else {
+        controller.signal.addEventListener("abort", abort, { once: true });
+        removeOpenAbort = () => controller.signal.removeEventListener("abort", abort);
+      }
+      openTimeoutId = timing.setTimeout(() => {
+        controller.abort(new AndroidCommandError(
+          "top_stream_open_timeout",
+          "CPU 采集流启动超时",
+        ));
+      }, config.commandTimeoutMs);
+    });
+    try {
+      const opened = await Promise.race([openPromise, cancelledOpen]);
+      if (
+        controller.signal.aborted
+        || generation !== cpuGeneration
+        || snapshot.phase !== "running"
+      ) {
+        void closeCpuHandle(opened);
+        return false;
+      }
+      cpuHandle = opened;
     } catch (error) {
-      if (generation === cpuGeneration) enableCpuFallback(errorReason(error, "top_stream_unavailable"));
+      void openPromise.then((lateHandle) => closeCpuHandle(lateHandle), () => {});
+      if (cpuController === controller) cpuController = null;
+      if (generation === cpuGeneration && snapshot.phase === "running") {
+        enableCpuFallback(errorReason(error, "top_stream_unavailable"));
+      }
       return false;
+    } finally {
+      if (openTimeoutId !== null) timing.clearTimeout(openTimeoutId);
+      removeOpenAbort();
     }
 
     const handle = cpuHandle;
@@ -879,7 +1005,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     let streamFailureReason = null;
     const stderrConsumer = handle?.stderr
       ? (async () => {
-          for await (const _chunk of textChunks(handle.stderr)) {
+          for await (const _chunk of textChunks(handle.stderr, controller.signal)) {
             // shell_v2 stdout and stderr are separate streams. stderr must be
             // drained concurrently or its backpressure can stall the device.
           }
@@ -887,7 +1013,7 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
       : Promise.resolve();
     const stdoutConsumer = (async () => {
       try {
-        for await (const chunk of textChunks(streamSource(handle))) decoder.push(chunk);
+        for await (const chunk of textChunks(streamSource(handle), controller.signal)) decoder.push(chunk);
         decoder.finish();
       } catch (error) {
         if (!isAbortError(error, controller.signal) && generation === cpuGeneration) {
@@ -1097,6 +1223,11 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
             ? startConfig.cpuTopInvalidBlockLimit
             : DEFAULT_CPU_TOP_INVALID_BLOCK_LIMIT,
         ),
+      ),
+      cpuStreamCleanupMs: positiveDuration(
+        startConfig.cpuStreamCleanupMs,
+        DEFAULT_CPU_STREAM_CLEANUP_MS,
+        { minimum: 10, maximum: 10_000 },
       ),
     };
     sessionController = new AbortController();
