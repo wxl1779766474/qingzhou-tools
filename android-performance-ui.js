@@ -1,4 +1,5 @@
 import {
+  MAX_PERFORMANCE_SAMPLES,
   appendPerformanceSample,
   createPerformanceReport,
   normalizePerformanceSample,
@@ -13,6 +14,13 @@ import { createPerformanceReportRepository } from "./android-performance-storage
 const DEFAULT_DURATION_MINUTES = 10;
 const MAX_DURATION_MINUTES = 60;
 const REPORT_LIST_LIMIT = 20;
+const CHART_WINDOW_MS = 10 * 60_000;
+
+export const PERFORMANCE_CHART_FIELDS = Object.freeze({
+  cpu: "cpuPercent",
+  memory: "memoryPssMb",
+  frame: "frameTimeMs",
+});
 
 const PHASE_LABELS = Object.freeze({
   loading: "正在准备浏览器连接能力",
@@ -191,18 +199,81 @@ function reportStatusForReason(reason) {
   return "interrupted";
 }
 
-function mergeMetricSample(samples, rawSample) {
+export function appendPerformanceMetricSample(samples, rawSample) {
+  const source = Array.isArray(samples) ? samples : [];
   const sample = normalizePerformanceSample(rawSample);
-  const previous = samples.at(-1);
-  if (!previous || previous.timestamp !== sample.timestamp) {
-    return appendPerformanceSample(samples, sample);
+  const previous = source.at(-1);
+  const sequenceAdvances = (
+    !previous ||
+    sample.sequence === null ||
+    previous?.sequence === null ||
+    sample.sequence > previous.sequence
+  );
+  if (
+    !previous ||
+    (sample.timestamp > previous.timestamp && sequenceAdvances) ||
+    (
+      sample.timestamp === previous.timestamp &&
+      sample.sequence !== null &&
+      (previous.sequence === null || sample.sequence > previous.sequence)
+    )
+  ) {
+    return [...source, sample]
+      .slice(-MAX_PERFORMANCE_SAMPLES);
   }
-  return appendPerformanceSample(samples.slice(0, -1), {
-    ...previous,
-    ...Object.fromEntries(
-      Object.entries(sample).filter(([key, value]) => key === "timestamp" || key === "sequence" || value !== null),
-    ),
-  });
+  return appendPerformanceSample(source, sample);
+}
+
+function normalizePerformanceMetricSamples(source) {
+  let samples = [];
+  for (const rawSample of Array.isArray(source) ? source : []) {
+    try {
+      samples = appendPerformanceMetricSample(samples, rawSample);
+    } catch {
+      // Optional malformed metrics do not invalidate the rest of a partial report.
+    }
+  }
+  return samples;
+}
+
+export function selectPerformanceChartSamples(samples, field) {
+  if (!Object.values(PERFORMANCE_CHART_FIELDS).includes(field)) {
+    throw new TypeError("未知的性能图表字段");
+  }
+  return normalizePerformanceMetricSamples(samples)
+    .filter((sample) => finite(sample[field]) !== null);
+}
+
+function latestFieldValue(samples, field) {
+  for (let index = samples.length - 1; index >= 0; index -= 1) {
+    const value = finite(samples[index]?.[field]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+export function createPerformanceReportView(report) {
+  const samples = normalizePerformanceMetricSamples(report?.samples);
+  const charts = Object.fromEntries(
+    Object.entries(PERFORMANCE_CHART_FIELDS).map(([key, field]) => [
+      key,
+      samples.filter((sample) => finite(sample[field]) !== null),
+    ]),
+  );
+  const latest = Object.fromEntries(
+    Object.values(METRIC_PRESENTATION).map(({ field }) => [
+      field,
+      latestFieldValue(samples, field),
+    ]),
+  );
+  latest.cpuRawPercent = latestFieldValue(samples, "cpuRawPercent");
+  latest.networkTotalBytes = finite(report?.summary?.networkDelta?.totalBytes);
+  return {
+    samples,
+    charts,
+    latest,
+    cpuUsesRawValue: latest.cpuPercent === null && latest.cpuRawPercent !== null,
+  };
 }
 
 function createMarkup() {
@@ -439,6 +510,9 @@ export function createAndroidPerformanceTool({
     refs.exportJson.disabled = !runtime.currentReport;
     refs.exportCsv.disabled = !runtime.currentReport;
     refs.clearReports.disabled = !runtime.reports.length;
+    for (const button of runtime.root.querySelectorAll('[data-performance-action="open-report"]')) {
+      button.disabled = running || runtime.phase === "preparing";
+    }
   }
 
   function updateDevice() {
@@ -465,10 +539,11 @@ export function createAndroidPerformanceTool({
     updateControls();
   }
 
-  function resetMetrics() {
+  function resetMetrics({ starting = false } = {}) {
     runtime.latest = {};
     runtime.samples = [];
     for (const [key] of Object.entries(METRIC_PRESENTATION)) updateMetric(key, null, "等待测试");
+    if (starting) updateMetric("cpu", null, "等待首个 CPU 样本");
     for (const chart of Object.values(runtime.charts)) chart.setSamples([]);
     for (const node of runtime.root?.querySelectorAll("[data-chart-latest]") ?? []) node.textContent = "—";
   }
@@ -492,11 +567,11 @@ export function createAndroidPerformanceTool({
   }
 
   function receiveSample(rawSample) {
-    if (!runtime.mounted || runtime.phase !== "running") return;
+    if (!runtime.mounted || !["preparing", "running"].includes(runtime.phase)) return;
     let sample;
     try {
       sample = normalizePerformanceSample(rawSample);
-      runtime.samples = mergeMetricSample(runtime.samples, rawSample);
+      runtime.samples = appendPerformanceMetricSample(runtime.samples, rawSample);
     } catch {
       return;
     }
@@ -510,32 +585,57 @@ export function createAndroidPerformanceTool({
         updateMetric(key, value, status);
       }
     }
+    if (sample.cpuPercent === null && sample.cpuRawPercent !== null) {
+      runtime.latest.cpuRawPercent = sample.cpuRawPercent;
+      updateMetric("cpu", sample.cpuRawPercent, "原始核占用，未归一化");
+    }
     const networkTotal = currentSampleNetworkTotal(rawSample, sample);
     if (networkTotal !== null) {
       runtime.latest.networkTotalBytes = networkTotal;
       updateMetric("network", networkTotal, rawSample?.metric === "network" ? "区间快照" : status);
     }
 
-    runtime.charts.cpu?.appendSample(sample);
-    runtime.charts.memory?.appendSample(sample);
-    runtime.charts.frame?.appendSample(sample);
+    if (sample.cpuPercent !== null) runtime.charts.cpu?.appendSample(sample);
+    if (sample.memoryPssMb !== null) runtime.charts.memory?.appendSample(sample);
+    if (sample.frameTimeMs !== null) runtime.charts.frame?.appendSample(sample);
     const cpuLatest = runtime.root.querySelector('[data-chart-latest="cpu"]');
     const memoryLatest = runtime.root.querySelector('[data-chart-latest="memory"]');
     const frameLatest = runtime.root.querySelector('[data-chart-latest="frame"]');
-    if (sample.cpuPercent !== null) cpuLatest.textContent = formatNumber(sample.cpuPercent, 1, "%");
-    if (sample.memoryPssMb !== null) memoryLatest.textContent = formatNumber(sample.memoryPssMb, 1, " MB");
-    if (sample.frameTimeMs !== null) frameLatest.textContent = formatNumber(sample.frameTimeMs, 1, " ms");
+    if (sample.cpuPercent !== null && cpuLatest) cpuLatest.textContent = formatNumber(sample.cpuPercent, 1, "%");
+    if (sample.memoryPssMb !== null && memoryLatest) memoryLatest.textContent = formatNumber(sample.memoryPssMb, 1, " MB");
+    if (sample.frameTimeMs !== null && frameLatest) frameLatest.textContent = formatNumber(sample.frameTimeMs, 1, " ms");
   }
 
   function handleCollectorStatus(event) {
     if (!runtime.mounted || !event) return;
     if (event.type === "metric" && event.metric && event.state) {
-      const key = event.metric === "memory" ? "memory"
-        : event.metric === "frame" ? "fps"
-          : event.metric === "battery" ? "temperature"
-            : event.metric;
-      const node = runtime.root.querySelector(`[data-metric-status="${key}"]`);
-      if (node && event.state !== "supported") node.textContent = event.reason || event.state;
+      const keys = event.metric === "frame"
+        ? ["fps", "jank"]
+        : event.metric === "battery"
+          ? ["temperature"]
+          : METRIC_PRESENTATION[event.metric]
+            ? [event.metric]
+            : [];
+      const label = event.metric === "cpu"
+        ? (
+            ["probing", "pending"].includes(event.state) ? "等待首个 CPU 样本"
+              : event.state === "supported" ? "CPU 采集中"
+                : event.state === "degraded" ? "已降级为低频 CPU 采集"
+                  : event.state === "paused" ? "CPU 暂时无数据"
+                    : event.state === "unsupported" ? "CPU 采集不可用"
+                      : "CPU 状态更新"
+          )
+        : (
+            event.state === "supported" ? "采集中"
+              : event.state === "degraded" ? "已降级采集"
+                : event.state === "paused" ? "暂时无数据"
+                  : event.state === "unsupported" ? "设备不支持"
+                    : event.reason || event.state
+          );
+      for (const key of keys) {
+        const node = runtime.root.querySelector(`[data-metric-status="${key}"]`);
+        if (node) node.textContent = label;
+      }
     }
     if (event.type === "target" && event.reason === "process-restarting") {
       refs.message.textContent = "目标 App 进程暂时消失，正在等待重新启动…";
@@ -577,11 +677,12 @@ export function createAndroidPerformanceTool({
   function renderReports() {
     if (!runtime.mounted) return;
     refs.clearReports.disabled = !runtime.reports.length;
+    const reportSwitchDisabled = ["preparing", "running", "stopping"].includes(runtime.phase);
     refs.reports.innerHTML = runtime.reports.length
       ? `<div class="performance-report-list">${runtime.reports.map((report) => {
           const packageName = report.app?.packageName || "未知应用";
           return `<article class="performance-report-row">
-            <button type="button" data-performance-action="open-report" data-report-id="${escapeHtml(report.id)}">
+            <button type="button" data-performance-action="open-report" data-report-id="${escapeHtml(report.id)}"${reportSwitchDisabled ? " disabled" : ""}>
               <span><strong>${escapeHtml(packageName)}</strong><small>${escapeHtml(formatLocalDate(report.createdAt))} · ${escapeHtml(formatDuration(report.endedAt - report.startedAt))}</small></span>
               <span>${escapeHtml(report.status === "completed" ? "完成" : report.status === "stopped" ? "已停止" : "部分报告")}</span>
             </button>
@@ -616,7 +717,44 @@ export function createAndroidPerformanceTool({
       <div class="performance-report-notes"><strong>结果说明</strong><p>这是快速诊断数据，不是实验室级功耗测试。缺失指标表示设备或目标渲染方式未提供相应数据。</p></div>`;
     refs.exportJson.disabled = false;
     refs.exportCsv.disabled = false;
-    updateMetric("network", summary.networkDelta?.totalBytes, summary.networkDelta?.totalBytes === null ? "暂无区间数据" : "测试区间 RX + TX");
+  }
+
+  function applyReportToView(report) {
+    const view = createPerformanceReportView(report);
+    runtime.currentReport = report;
+    runtime.samples = view.samples;
+    runtime.latest = { ...view.latest };
+
+    for (const [key, presentation] of Object.entries(METRIC_PRESENTATION)) {
+      const value = key === "network"
+        ? view.latest.networkTotalBytes
+        : view.latest[presentation.field];
+      const status = value === null
+        ? "报告无数据"
+        : key === "network"
+          ? "测试区间 RX + TX"
+          : "报告最终值";
+      updateMetric(key, value, status);
+    }
+    if (view.cpuUsesRawValue) {
+      updateMetric("cpu", view.latest.cpuRawPercent, "原始核占用，未归一化");
+    }
+
+    for (const [key, samples] of Object.entries(view.charts)) {
+      runtime.charts[key]?.setSamples(samples);
+    }
+    const latestLabels = {
+      cpu: view.latest.cpuPercent === null ? "—" : formatNumber(view.latest.cpuPercent, 1, "%"),
+      memory: view.latest.memoryPssMb === null ? "—" : formatNumber(view.latest.memoryPssMb, 1, " MB"),
+      frame: view.latest.frameTimeMs === null ? "—" : formatNumber(view.latest.frameTimeMs, 1, " ms"),
+    };
+    for (const [key, label] of Object.entries(latestLabels)) {
+      const node = runtime.root.querySelector(`[data-chart-latest="${key}"]`);
+      if (node) node.textContent = label;
+    }
+
+    renderCurrentReport();
+    updateControls();
   }
 
   async function saveReport(report) {
@@ -632,15 +770,7 @@ export function createAndroidPerformanceTool({
 
   function snapshotSamples(snapshot) {
     const source = Array.isArray(snapshot?.samples) ? snapshot.samples : runtime.samples;
-    let samples = [];
-    for (const sample of source) {
-      try {
-        samples = mergeMetricSample(samples, sample);
-      } catch {
-        // A malformed optional metric must not prevent the partial report.
-      }
-    }
-    return samples;
+    return normalizePerformanceMetricSamples(source);
   }
 
   async function finishReport(snapshot, reason) {
@@ -687,8 +817,7 @@ export function createAndroidPerformanceTool({
       },
       samples,
     }, { now: endedAt });
-    runtime.currentReport = report;
-    renderCurrentReport();
+    applyReportToView(report);
     await saveReport(report);
     return report;
   }
@@ -789,7 +918,7 @@ export function createAndroidPerformanceTool({
     }
 
     const durationMinutes = normalizeDurationMinutes(refs.duration.value);
-    resetMetrics();
+    resetMetrics({ starting: true });
     setPhase("preparing", "正在确认目标进程、记录网络基线并重置帧统计…");
     runtime.session = createPerformanceSession({
       runner: runtime.runner,
@@ -841,11 +970,14 @@ export function createAndroidPerformanceTool({
   }
 
   async function openReport(id) {
+    if (["preparing", "running", "stopping"].includes(runtime.phase)) {
+      showToast("请先停止当前测试，再查看历史报告");
+      return;
+    }
     try {
       const report = await runtime.repository.getReport(id);
       if (!report) throw new Error("报告不存在");
-      runtime.currentReport = report;
-      renderCurrentReport();
+      applyReportToView(report);
       refs.report.scrollIntoView?.({ behavior: "smooth", block: "start" });
     } catch {
       showToast("这份报告已不存在或无法读取");
@@ -910,7 +1042,7 @@ export function createAndroidPerformanceTool({
     }
     if (action === "start") await start();
     if (action === "stop") await stop("user");
-    if (action === "open-report") await openReport(button.dataset.reportId);
+    if (action === "open-report" && !button.disabled) await openReport(button.dataset.reportId);
     if (action === "delete-report") await deleteReport(button.dataset.reportId);
     if (action === "clear-reports") await clearReports();
     if (action === "export-json") exportReport("json");
@@ -947,16 +1079,19 @@ export function createAndroidPerformanceTool({
       series: [{ key: "cpuPercent", label: "CPU", unit: "%", color: "#0d7965" }],
       minimum: 0,
       maximum: 100,
+      windowMs: CHART_WINDOW_MS,
     });
     runtime.charts.memory = createPerformanceChart(runtime.root.querySelector('[data-performance-chart="memory"]'), {
       title: "PSS 内存曲线",
       series: [{ key: "memoryPssMb", label: "PSS", unit: " MB", color: "#438cf0" }],
       minimum: 0,
+      windowMs: CHART_WINDOW_MS,
     });
     runtime.charts.frame = createPerformanceChart(runtime.root.querySelector('[data-performance-chart="frame"]'), {
       title: "帧耗时曲线",
       series: [{ key: "frameTimeMs", label: "帧耗时", unit: " ms", color: "#d97832" }],
       minimum: 0,
+      windowMs: CHART_WINDOW_MS,
     });
   }
 
