@@ -2,7 +2,7 @@ import {
   ANDROID_COMMAND_IDS,
   AndroidCommandError,
   validateAndroidPackageName,
-} from "./android-performance-commands.js";
+} from "./android-performance-commands.js?v=20260724-memory-v3";
 import {
   computeProcCpuDelta,
   computeNetworkDelta,
@@ -30,7 +30,7 @@ import {
   parseTopHelp,
   parseTopSnapshot,
   summarizeFrameStats,
-} from "./android-performance-parsers.js";
+} from "./android-performance-parsers.js?v=20260724-memory-v3";
 
 const SCHEMA_VERSION = 1;
 const METRIC_NAMES = Object.freeze([
@@ -275,6 +275,8 @@ function createInitialSnapshot() {
       memoryPssKb: null,
       memoryJavaHeapKb: null,
       memoryNativeHeapKb: null,
+      memoryCodeKb: null,
+      memoryGraphicsKb: null,
       memoryRssKb: null,
       frameDurationMs: null,
       frameDurationsMs: null,
@@ -344,6 +346,8 @@ function metricFields(metric, value) {
         memoryPssKb: value.pssKb,
         memoryJavaHeapKb: value.javaHeapKb,
         memoryNativeHeapKb: value.nativeHeapKb,
+        memoryCodeKb: value.codeKb,
+        memoryGraphicsKb: value.graphicsKb,
         memoryRssKb: value.rssKb,
       };
     case "frame":
@@ -755,6 +759,12 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
     if (results.some((value) => !Number.isFinite(value.nativeHeapKb))) {
       missingFields.push("memoryNativeHeapKb");
     }
+    if (results.some((value) => !Number.isFinite(value.codeKb))) {
+      missingFields.push("memoryCodeKb");
+    }
+    if (results.some((value) => !Number.isFinite(value.graphicsKb))) {
+      missingFields.push("memoryGraphicsKb");
+    }
     const diagnostics = {
       ...(failures > 0 ? { partial: true, failedProcessCount: failures } : {}),
       ...(missingFields.length > 0 ? { missingFields } : {}),
@@ -766,6 +776,8 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
         pssKb: sumNullable(results, "pssKb"),
         javaHeapKb: sumComplete(results, "javaHeapKb"),
         nativeHeapKb: sumComplete(results, "nativeHeapKb"),
+        codeKb: sumComplete(results, "codeKb"),
+        graphicsKb: sumComplete(results, "graphicsKb"),
         rssKb: sumNullable(results, "rssKb"),
       },
       totalDuration,
