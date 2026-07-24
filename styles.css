@@ -2525,22 +2525,76 @@ body.dialog-open {
   line-height: 1.55;
 }
 
-.performance-memory-guide dl {
+.performance-memory-series {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.performance-memory-series legend {
+  margin: 0 0 8px;
+  padding: 0;
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 780;
+}
+
+.performance-memory-series-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 8px;
-  margin: 0;
 }
 
-.performance-memory-guide dl > div {
+.performance-memory-series-option {
   min-width: 0;
+  min-height: 86px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
   padding: 9px 10px;
   border: 1px solid var(--line);
   border-radius: 11px;
   background: rgba(255, 255, 255, 0.78);
+  cursor: pointer;
 }
 
-.performance-memory-guide dt {
+.performance-memory-series-option:hover {
+  border-color: var(--line-strong);
+  background: rgba(255, 255, 255, 0.96);
+}
+
+.performance-memory-series-option.is-series-hidden {
+  border-style: dashed;
+  background: rgba(242, 247, 246, 0.68);
+}
+
+.performance-memory-series-option.is-series-hidden .performance-memory-series-copy {
+  opacity: 0.58;
+}
+
+.performance-memory-series-option:has(input:focus-visible) {
+  outline: 3px solid rgba(67, 140, 240, 0.3);
+  outline-offset: 2px;
+  border-color: #438cf0;
+}
+
+.performance-memory-series-option > input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #438cf0;
+}
+
+.performance-memory-series-copy {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 8px;
+}
+
+.performance-memory-series-copy > strong {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2549,7 +2603,7 @@ body.dialog-open {
   font-weight: 780;
 }
 
-.performance-memory-guide dt > span {
+.performance-memory-series-dot {
   width: 7px;
   height: 7px;
   flex: 0 0 7px;
@@ -2557,24 +2611,38 @@ body.dialog-open {
   background: #438cf0;
 }
 
-.performance-memory-guide .is-java dt > span {
+.performance-memory-series-option.is-java .performance-memory-series-dot {
   background: #0d7965;
 }
 
-.performance-memory-guide .is-native dt > span {
+.performance-memory-series-option.is-native .performance-memory-series-dot {
   background: #d97832;
 }
 
-.performance-memory-guide .is-code dt > span {
+.performance-memory-series-option.is-code .performance-memory-series-dot {
   background: #7b61d1;
 }
 
-.performance-memory-guide .is-graphics dt > span {
+.performance-memory-series-option.is-graphics .performance-memory-series-dot {
   background: #b64f8c;
 }
 
-.performance-memory-guide dd {
-  margin: 5px 0 0;
+.performance-memory-series-state {
+  align-self: start;
+  min-width: 42px;
+  color: #0d7965;
+  font-size: 9px;
+  font-weight: 760;
+  line-height: 1.45;
+  text-align: right;
+}
+
+.performance-memory-series-option.is-series-hidden .performance-memory-series-state {
+  color: var(--muted);
+}
+
+.performance-memory-series-copy > small {
+  grid-column: 1 / -1;
   color: var(--muted);
   font-size: 9px;
   line-height: 1.5;
@@ -2863,7 +2931,7 @@ body.dialog-open {
       "frame";
   }
 
-  .performance-memory-guide dl {
+  .performance-memory-series-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -2936,7 +3004,11 @@ body.dialog-open {
     height: 210px;
   }
 
-  .performance-memory-guide dl {
+  .performance-memory-series-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .performance-memory-series-option {
+    min-height: 0;
   }
 }

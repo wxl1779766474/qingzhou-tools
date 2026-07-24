@@ -340,8 +340,16 @@ export function createPerformanceChart(canvas, options = {}) {
   const defaultWidth = Math.max(240, Number(options.width) || 640);
   const defaultHeight = Math.max(160, Number(options.height) || 260);
   const emptyText = String(options.emptyText ?? "开始测试后显示实时曲线");
+  const noVisibleSeriesText = String(
+    options.noVisibleSeriesText ?? "请选择至少一个图表指标",
+  );
+  const noVisibleSeriesAriaText = String(
+    options.noVisibleSeriesAriaText ?? "当前没有启用的图表指标",
+  );
   const title = String(options.title ?? series.map((item) => item.label).join(" / "));
   const showLegend = options.showLegend !== false;
+  const seriesKeys = new Set(series.map((item) => item.key));
+  const visibleSeriesKeys = new Set(seriesKeys);
   let samples = [];
   let destroyed = false;
   let scheduledDraw = null;
@@ -459,6 +467,17 @@ export function createPerformanceChart(canvas, options = {}) {
     context.fillText(emptyText, cssWidth / 2, cssHeight / 2);
   }
 
+  function drawNoVisibleSeriesState() {
+    pointerClientPosition = null;
+    setHoverActive(false);
+    canvas.setAttribute?.("aria-label", `${title}，${noVisibleSeriesAriaText}`);
+    context.fillStyle = options.mutedColor ?? "#607571";
+    context.font = '13px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(noVisibleSeriesText, cssWidth / 2, cssHeight / 2);
+  }
+
   function drawHoverLayer({
     duration,
     maximum,
@@ -466,6 +485,7 @@ export function createPerformanceChart(canvas, options = {}) {
     plotWidth,
     points,
     range,
+    series: visibleSeries,
     startedAt,
   }) {
     const pointer = getPointerCanvasPosition();
@@ -478,7 +498,7 @@ export function createPerformanceChart(canvas, options = {}) {
 
     const selectedX = CHART_PADDING.left +
       ((selectedSample.timestamp - startedAt) / duration) * plotWidth;
-    const selectedValues = series.map((item) => ({
+    const selectedValues = visibleSeries.map((item) => ({
       item,
       value: getSeriesValue(selectedSample, item),
     }));
@@ -649,8 +669,21 @@ export function createPerformanceChart(canvas, options = {}) {
     context.fillStyle = options.backgroundColor ?? "#f8fbfa";
     context.fillRect(0, 0, cssWidth, cssHeight);
 
-    const points = downsampleChartSamples(samples, series, maxPoints);
-    const values = finiteValues(points, series);
+    const visibleSeries = series.filter((item) => visibleSeriesKeys.has(item.key));
+    if (!visibleSeries.length) {
+      drawNoVisibleSeriesState();
+      return;
+    }
+
+    const visibleSamples = samples.filter(
+      (sample) => hasSeriesValue(sample, visibleSeries),
+    );
+    const points = downsampleChartSamples(
+      visibleSamples,
+      visibleSeries,
+      maxPoints,
+    );
+    const values = finiteValues(points, visibleSeries);
     if (!points.length || !values.length) {
       drawEmptyState();
       return;
@@ -696,7 +729,7 @@ export function createPerformanceChart(canvas, options = {}) {
       let legendX = padding.left;
       context.textAlign = "left";
       context.textBaseline = "middle";
-      for (const item of series) {
+      for (const item of visibleSeries) {
         const latest = getSeriesValue(latestSample, item);
         context.fillStyle = item.color;
         context.fillRect(legendX, 15, 10, 3);
@@ -707,7 +740,7 @@ export function createPerformanceChart(canvas, options = {}) {
       }
     }
 
-    for (const item of series) {
+    for (const item of visibleSeries) {
       const seriesPoints = points.flatMap((sample) => {
         const value = getSeriesValue(sample, item);
         if (value === null) return [];
@@ -745,10 +778,11 @@ export function createPerformanceChart(canvas, options = {}) {
       plotWidth,
       points,
       range,
+      series: visibleSeries,
       startedAt,
     }));
 
-    const accessibleSummary = series.map((item) => {
+    const accessibleSummary = visibleSeries.map((item) => {
       const latest = getSeriesValue(latestSample, item);
       return `${item.label}${latest === null ? "暂无数据" : `${formatNumber(latest)}${item.unit}`}`;
     }).join("，");
@@ -778,6 +812,31 @@ export function createPerformanceChart(canvas, options = {}) {
     requestDraw();
   }
 
+  function setSeriesVisible(key, visible) {
+    if (typeof visible !== "boolean") {
+      throw new TypeError("图表指标 visible 必须是布尔值");
+    }
+    if (destroyed || !seriesKeys.has(key)) return false;
+
+    const current = visibleSeriesKeys.has(key);
+    if (current === visible) return false;
+    if (visible) visibleSeriesKeys.add(key);
+    else visibleSeriesKeys.delete(key);
+
+    if (!visibleSeriesKeys.size) {
+      pointerClientPosition = null;
+      setHoverActive(false);
+    }
+    requestDraw();
+    return true;
+  }
+
+  function getSeriesVisibility() {
+    return Object.fromEntries(
+      series.map((item) => [item.key, visibleSeriesKeys.has(item.key)]),
+    );
+  }
+
   canvas.addEventListener?.("pointermove", handlePointerMove);
   canvas.addEventListener?.("pointerleave", handlePointerExit);
   canvas.addEventListener?.("pointercancel", handlePointerExit);
@@ -791,6 +850,8 @@ export function createPerformanceChart(canvas, options = {}) {
   return {
     setSamples,
     appendSample,
+    setSeriesVisible,
+    getSeriesVisibility,
     resize,
     render: requestDraw,
     getSamples: () => samples.map((sample) => ({ ...sample })),

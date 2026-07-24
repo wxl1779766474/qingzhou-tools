@@ -7,8 +7,13 @@ import {
   performanceReportToJson,
 } from "./android-performance-core.js?v=20260724-memory-v3";
 import { createAndroidShellRunner, validateAndroidPackageName } from "./android-performance-commands.js?v=20260724-memory-v3";
-import { createPerformanceChart } from "./android-performance-chart.js?v=20260724-memory-v3";
+import { createPerformanceChart } from "./android-performance-chart.js?v=20260724-memory-series-v1";
 import { createPerformanceSession, inspectAndroidDevice } from "./android-performance-collectors.js?v=20260724-memory-v3";
+import {
+  ANDROID_MEMORY_SERIES_KEYS,
+  readAndroidMemorySeriesPreferences,
+  writeAndroidMemorySeriesPreferences,
+} from "./android-performance-preferences.js?v=20260724-memory-series-v1";
 import { createPerformanceReportRepository } from "./android-performance-storage.js?v=20260724-memory-v3";
 
 const DEFAULT_DURATION_MINUTES = 10;
@@ -584,19 +589,33 @@ function memoryMetricCard() {
 function memoryGuide() {
   return `<div class="performance-memory-guide" aria-label="App 内存指标说明">
     <p>分类来自 Android App Summary；当前展示主要分类，PSS 还包含 Stack、Private Other 和 System，因此分类之和不等于 PSS。</p>
-    <dl>
-      <div class="is-pss"><dt><span aria-hidden="true"></span>PSS</dt><dd>目标 App 全部进程的总内存权重；独占内存全部计入，共享内存按比例计入。</dd></div>
-      <div class="is-java"><dt><span aria-hidden="true"></span>Java Heap</dt><dd>Java/Kotlin 对象相关的 ART/Dalvik 堆归因内存，不是 Heap Alloc。</dd></div>
-      <div class="is-native"><dt><span aria-hidden="true"></span>Native Heap</dt><dd>C/C++、JNI 等 native malloc 堆的归因内存，不是 Heap Alloc。</dd></div>
-      <div class="is-code"><dt><span aria-hidden="true"></span>Code</dt><dd>已载入的 APK、DEX/OAT、SO、字体与代码缓存等静态代码和资源。</dd></div>
-      <div class="is-graphics"><dt><span aria-hidden="true"></span>Graphics</dt><dd>图形缓冲、纹理及 EGL/GL 等图形私有内存；部分机型可能受驱动上报影响。</dd></div>
-    </dl>
+    <fieldset class="performance-memory-series">
+      <legend>选择曲线显示项</legend>
+      <div class="performance-memory-series-grid">
+        ${memorySeriesOption("memoryPssMb", "PSS", "is-pss", "目标 App 全部进程的总内存权重；独占内存全部计入，共享内存按比例计入。")}
+        ${memorySeriesOption("memoryJavaHeapKb", "Java Heap", "is-java", "Java/Kotlin 对象相关的 ART/Dalvik 堆归因内存，不是 Heap Alloc。")}
+        ${memorySeriesOption("memoryNativeHeapKb", "Native Heap", "is-native", "C/C++、JNI 等 native malloc 堆的归因内存，不是 Heap Alloc。")}
+        ${memorySeriesOption("memoryCodeKb", "Code", "is-code", "已载入的 APK、DEX/OAT、SO、字体与代码缓存等静态代码和资源。")}
+        ${memorySeriesOption("memoryGraphicsKb", "Graphics", "is-graphics", "图形缓冲、纹理及 EGL/GL 等图形私有内存；部分机型可能受驱动上报影响。")}
+      </div>
+    </fieldset>
   </div>`;
+}
+
+function memorySeriesOption(key, label, className, description) {
+  return `<label class="performance-memory-series-option ${className}" data-memory-series-option="${key}">
+    <input type="checkbox" name="performance-memory-series" value="${key}" data-performance-memory-series="${key}" aria-controls="performance-chart-memory" checked>
+    <span class="performance-memory-series-copy">
+      <strong><span class="performance-memory-series-dot" aria-hidden="true"></span>${label}</strong>
+      <span class="performance-memory-series-state" data-memory-series-state aria-hidden="true">显示中</span>
+      <small>${description}</small>
+    </span>
+  </label>`;
 }
 
 function chartCard(key, title, hint) {
   const guide = key === "memory" ? memoryGuide() : "";
-  return `<article class="performance-chart-card" data-performance-chart-card="${key}"><header><div><h3>${title}</h3><p>${hint}</p></div><span data-chart-latest="${key}">—</span></header><canvas data-performance-chart="${key}" height="240"></canvas>${guide}</article>`;
+  return `<article class="performance-chart-card" data-performance-chart-card="${key}"><header><div><h3>${title}</h3><p>${hint}</p></div><span data-chart-latest="${key}">—</span></header><canvas id="performance-chart-${key}" data-performance-chart="${key}" height="240"></canvas>${guide}</article>`;
 }
 
 function normalizeDurationMinutes(value) {
@@ -647,6 +666,9 @@ export function createAndroidPerformanceTool({
     currentReport: null,
     reports: [],
     charts: {},
+    memorySeriesVisibility: new Set(ANDROID_MEMORY_SERIES_KEYS),
+    memorySeriesPreferenceLoaded: false,
+    memorySeriesPreferenceStorage: null,
     timerId: null,
     stopPromise: null,
     loadToken: 0,
@@ -656,6 +678,66 @@ export function createAndroidPerformanceTool({
   };
 
   const refs = {};
+
+  function loadMemorySeriesPreferenceOnce() {
+    if (runtime.memorySeriesPreferenceLoaded) return;
+    runtime.memorySeriesPreferenceLoaded = true;
+    try {
+      runtime.memorySeriesPreferenceStorage = globalThis.localStorage ?? null;
+    } catch {
+      runtime.memorySeriesPreferenceStorage = null;
+    }
+
+    try {
+      const stored = readAndroidMemorySeriesPreferences(
+        runtime.memorySeriesPreferenceStorage,
+      );
+      if (Array.isArray(stored)) runtime.memorySeriesVisibility = new Set(stored);
+    } catch {
+      // Storage access must never prevent the tool from mounting with safe defaults.
+    }
+  }
+
+  function syncMemorySeriesControl(key) {
+    if (!runtime.root) return;
+    const control = runtime.root.querySelector(
+      `[data-performance-memory-series="${key}"]`,
+    );
+    if (!control) return;
+    const visible = runtime.memorySeriesVisibility.has(key);
+    const option = control.closest("[data-memory-series-option]");
+    control.checked = visible;
+    option?.classList.toggle("is-series-hidden", !visible);
+    const state = option?.querySelector("[data-memory-series-state]");
+    if (state) state.textContent = visible ? "显示中" : "已隐藏";
+  }
+
+  function applyMemorySeriesVisibility() {
+    for (const key of ANDROID_MEMORY_SERIES_KEYS) {
+      const visible = runtime.memorySeriesVisibility.has(key);
+      runtime.charts.memory?.setSeriesVisible(key, visible);
+      syncMemorySeriesControl(key);
+    }
+  }
+
+  function setMemorySeriesVisibility(key, visible) {
+    if (!ANDROID_MEMORY_SERIES_KEYS.includes(key)) return false;
+    if (visible) runtime.memorySeriesVisibility.add(key);
+    else runtime.memorySeriesVisibility.delete(key);
+
+    runtime.charts.memory?.setSeriesVisible(key, visible);
+    syncMemorySeriesControl(key);
+
+    try {
+      writeAndroidMemorySeriesPreferences(
+        runtime.memorySeriesPreferenceStorage,
+        [...runtime.memorySeriesVisibility],
+      );
+    } catch {
+      // The in-memory choice stays active even when browser persistence is unavailable.
+    }
+    return true;
+  }
 
   function captureRefs() {
     refs.phase = runtime.root.querySelector("[data-performance-phase]");
@@ -1347,6 +1429,15 @@ export function createAndroidPerformanceTool({
     }
   }
 
+  function handleChange(event) {
+    const control = event.target.closest("[data-performance-memory-series]");
+    if (!control || !runtime.root.contains(control)) return;
+    setMemorySeriesVisibility(
+      control.dataset.performanceMemorySeries,
+      control.checked,
+    );
+  }
+
   function handleBeforeUnload(event) {
     if (runtime.phase !== "running" && runtime.phase !== "preparing") return;
     event.preventDefault();
@@ -1365,6 +1456,8 @@ export function createAndroidPerformanceTool({
       title: "App 内存曲线",
       series: PERFORMANCE_MEMORY_CHART_SERIES,
       showLegend: false,
+      noVisibleSeriesText: "请选择至少一条内存曲线",
+      noVisibleSeriesAriaText: "当前没有启用的内存曲线",
       minimum: 0,
       windowMs: CHART_WINDOW_MS,
     });
@@ -1412,8 +1505,11 @@ export function createAndroidPerformanceTool({
     captureRefs();
     runtime.root.addEventListener("click", handleClick);
     runtime.root.addEventListener("input", handleInput);
+    runtime.root.addEventListener("change", handleChange);
     globalThis.addEventListener?.("beforeunload", handleBeforeUnload);
+    loadMemorySeriesPreferenceOnce();
     createCharts();
+    applyMemorySeriesVisibility();
     resetMetrics();
     await Promise.all([initializeAdapter(), loadReports()]);
   }
@@ -1435,6 +1531,7 @@ export function createAndroidPerformanceTool({
     runtime.loadToken += 1;
     runtime.root.removeEventListener("click", handleClick);
     runtime.root.removeEventListener("input", handleInput);
+    runtime.root.removeEventListener("change", handleChange);
     globalThis.removeEventListener?.("beforeunload", handleBeforeUnload);
     for (const chart of Object.values(runtime.charts)) chart.destroy();
     runtime.charts = {};
