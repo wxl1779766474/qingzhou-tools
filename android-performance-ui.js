@@ -5,11 +5,11 @@ import {
   normalizePerformanceSample,
   performanceReportToCsv,
   performanceReportToJson,
-} from "./android-performance-core.js";
-import { createAndroidShellRunner, validateAndroidPackageName } from "./android-performance-commands.js";
-import { createPerformanceChart } from "./android-performance-chart.js?v=20260724-memory-v2";
-import { createPerformanceSession, inspectAndroidDevice } from "./android-performance-collectors.js?v=20260724-memory-v2";
-import { createPerformanceReportRepository } from "./android-performance-storage.js";
+} from "./android-performance-core.js?v=20260724-memory-v3";
+import { createAndroidShellRunner, validateAndroidPackageName } from "./android-performance-commands.js?v=20260724-memory-v3";
+import { createPerformanceChart } from "./android-performance-chart.js?v=20260724-memory-v3";
+import { createPerformanceSession, inspectAndroidDevice } from "./android-performance-collectors.js?v=20260724-memory-v3";
+import { createPerformanceReportRepository } from "./android-performance-storage.js?v=20260724-memory-v3";
 
 const DEFAULT_DURATION_MINUTES = 10;
 const MAX_DURATION_MINUTES = 60;
@@ -28,6 +28,8 @@ const PERFORMANCE_CHART_SERIES_FIELDS = Object.freeze({
     "memoryPssMb",
     "memoryJavaHeapKb",
     "memoryNativeHeapKb",
+    "memoryCodeKb",
+    "memoryGraphicsKb",
   ]),
   frame: Object.freeze(["frameTimeMs"]),
 });
@@ -52,6 +54,20 @@ export const PERFORMANCE_MEMORY_CHART_SERIES = Object.freeze([
     label: "Native Heap",
     unit: " MB",
     color: "#d97832",
+    scale: 1 / 1024,
+  }),
+  Object.freeze({
+    key: "memoryCodeKb",
+    label: "Code",
+    unit: " MB",
+    color: "#7b61d1",
+    scale: 1 / 1024,
+  }),
+  Object.freeze({
+    key: "memoryGraphicsKb",
+    label: "Graphics",
+    unit: " MB",
+    color: "#b64f8c",
     scale: 1 / 1024,
   }),
 ]);
@@ -494,7 +510,7 @@ function createMarkup() {
         </div>
         <div class="performance-chart-grid">
           ${chartCard("cpu", "CPU 曲线", "整机占比 0–100%")}
-          ${chartCard("memory", "App 内存曲线", "PSS 总内存与堆分类")}
+          ${chartCard("memory", "App 内存曲线", "PSS 总内存与 App Summary 主要归因分类")}
           ${chartCard("frame", "帧耗时曲线", "普通 View/HWUI App")}
         </div>
       </section>
@@ -552,13 +568,35 @@ function memoryMetricCard() {
         <span>Native Heap</span>
         <strong data-memory-value="native">—</strong>
       </span>
+      <span class="performance-memory-breakdown-item is-code">
+        <span>Code</span>
+        <strong data-memory-value="code">—</strong>
+      </span>
+      <span class="performance-memory-breakdown-item is-graphics">
+        <span>Graphics</span>
+        <strong data-memory-value="graphics">—</strong>
+      </span>
     </div>
     <p data-metric-status="memory">等待测试</p>
   </article>`;
 }
 
+function memoryGuide() {
+  return `<div class="performance-memory-guide" aria-label="App 内存指标说明">
+    <p>分类来自 Android App Summary；当前展示主要分类，PSS 还包含 Stack、Private Other 和 System，因此分类之和不等于 PSS。</p>
+    <dl>
+      <div class="is-pss"><dt><span aria-hidden="true"></span>PSS</dt><dd>目标 App 全部进程的总内存权重；独占内存全部计入，共享内存按比例计入。</dd></div>
+      <div class="is-java"><dt><span aria-hidden="true"></span>Java Heap</dt><dd>Java/Kotlin 对象相关的 ART/Dalvik 堆归因内存，不是 Heap Alloc。</dd></div>
+      <div class="is-native"><dt><span aria-hidden="true"></span>Native Heap</dt><dd>C/C++、JNI 等 native malloc 堆的归因内存，不是 Heap Alloc。</dd></div>
+      <div class="is-code"><dt><span aria-hidden="true"></span>Code</dt><dd>已载入的 APK、DEX/OAT、SO、字体与代码缓存等静态代码和资源。</dd></div>
+      <div class="is-graphics"><dt><span aria-hidden="true"></span>Graphics</dt><dd>图形缓冲、纹理及 EGL/GL 等图形私有内存；部分机型可能受驱动上报影响。</dd></div>
+    </dl>
+  </div>`;
+}
+
 function chartCard(key, title, hint) {
-  return `<article class="performance-chart-card"><header><div><h3>${title}</h3><p>${hint}</p></div><span data-chart-latest="${key}">—</span></header><canvas data-performance-chart="${key}" height="240"></canvas></article>`;
+  const guide = key === "memory" ? memoryGuide() : "";
+  return `<article class="performance-chart-card" data-performance-chart-card="${key}"><header><div><h3>${title}</h3><p>${hint}</p></div><span data-chart-latest="${key}">—</span></header><canvas data-performance-chart="${key}" height="240"></canvas>${guide}</article>`;
 }
 
 function normalizeDurationMinutes(value) {
@@ -724,18 +762,28 @@ export function createAndroidPerformanceTool({
     const pss = finite(sample?.memoryPssMb);
     const javaHeap = finite(sample?.memoryJavaHeapKb);
     const nativeHeap = finite(sample?.memoryNativeHeapKb);
+    const code = finite(sample?.memoryCodeKb);
+    const graphics = finite(sample?.memoryGraphicsKb);
     const pssNode = runtime.root.querySelector('[data-metric-value="memory"]');
     const javaNode = runtime.root.querySelector('[data-memory-value="java"]');
     const nativeNode = runtime.root.querySelector('[data-memory-value="native"]');
+    const codeNode = runtime.root.querySelector('[data-memory-value="code"]');
+    const graphicsNode = runtime.root.querySelector('[data-memory-value="graphics"]');
     const statusNode = runtime.root.querySelector('[data-metric-status="memory"]');
     const card = runtime.root.querySelector('[data-metric-card="memory"]');
     if (pssNode) pssNode.textContent = formatNumber(pss, 1);
     if (javaNode) javaNode.textContent = formatMemoryKilobytes(javaHeap);
     if (nativeNode) nativeNode.textContent = formatMemoryKilobytes(nativeHeap);
+    if (codeNode) codeNode.textContent = formatMemoryKilobytes(code);
+    if (graphicsNode) graphicsNode.textContent = formatMemoryKilobytes(graphics);
     if (statusNode) statusNode.textContent = status;
     card?.classList.toggle(
       "is-unavailable",
-      pss === null && javaHeap === null && nativeHeap === null,
+      pss === null &&
+        javaHeap === null &&
+        nativeHeap === null &&
+        code === null &&
+        graphics === null,
     );
   }
 
@@ -899,6 +947,8 @@ export function createAndroidPerformanceTool({
     const pss = summary?.memoryPssMb || {};
     const javaHeap = summary?.memoryJavaHeapKb || {};
     const nativeHeap = summary?.memoryNativeHeapKb || {};
+    const code = summary?.memoryCodeKb || {};
+    const graphics = summary?.memoryGraphicsKb || {};
     return `<div class="performance-report-memory">
       <span>App 内存</span>
       <strong>${escapeHtml(formatNumber(pss.average, 1, " MB"))}</strong>
@@ -906,6 +956,8 @@ export function createAndroidPerformanceTool({
       <div class="performance-report-memory-breakdown">
         <span class="is-java"><span>Java Heap</span><b>平均 ${escapeHtml(formatMemoryKilobytes(javaHeap.average))}</b><small>峰值 ${escapeHtml(formatMemoryKilobytes(javaHeap.maximum))}</small></span>
         <span class="is-native"><span>Native Heap</span><b>平均 ${escapeHtml(formatMemoryKilobytes(nativeHeap.average))}</b><small>峰值 ${escapeHtml(formatMemoryKilobytes(nativeHeap.maximum))}</small></span>
+        <span class="is-code"><span>Code</span><b>平均 ${escapeHtml(formatMemoryKilobytes(code.average))}</b><small>峰值 ${escapeHtml(formatMemoryKilobytes(code.maximum))}</small></span>
+        <span class="is-graphics"><span>Graphics</span><b>平均 ${escapeHtml(formatMemoryKilobytes(graphics.average))}</b><small>峰值 ${escapeHtml(formatMemoryKilobytes(graphics.maximum))}</small></span>
       </div>
     </div>`;
   }
@@ -1312,6 +1364,7 @@ export function createAndroidPerformanceTool({
     runtime.charts.memory = createPerformanceChart(runtime.root.querySelector('[data-performance-chart="memory"]'), {
       title: "App 内存曲线",
       series: PERFORMANCE_MEMORY_CHART_SERIES,
+      showLegend: false,
       minimum: 0,
       windowMs: CHART_WINDOW_MS,
     });
