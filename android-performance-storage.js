@@ -1,7 +1,7 @@
 import {
   clonePerformanceReport,
   parsePerformanceReport,
-} from "./android-performance-core.js";
+} from "./android-performance-core.js?v=20260724-memory-v3";
 
 export const ANDROID_PERFORMANCE_DATABASE_NAME = "lightboat-tools";
 export const ANDROID_PERFORMANCE_DATABASE_VERSION = 1;
