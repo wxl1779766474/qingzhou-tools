@@ -7,8 +7,8 @@ import {
   performanceReportToJson,
 } from "./android-performance-core.js";
 import { createAndroidShellRunner, validateAndroidPackageName } from "./android-performance-commands.js";
-import { createPerformanceChart } from "./android-performance-chart.js";
-import { createPerformanceSession, inspectAndroidDevice } from "./android-performance-collectors.js";
+import { createPerformanceChart } from "./android-performance-chart.js?v=20260724-memory-v2";
+import { createPerformanceSession, inspectAndroidDevice } from "./android-performance-collectors.js?v=20260724-memory-v2";
 import { createPerformanceReportRepository } from "./android-performance-storage.js";
 
 const DEFAULT_DURATION_MINUTES = 10;
