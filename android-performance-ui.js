@@ -22,6 +22,42 @@ export const PERFORMANCE_CHART_FIELDS = Object.freeze({
   frame: "frameTimeMs",
 });
 
+const PERFORMANCE_CHART_SERIES_FIELDS = Object.freeze({
+  cpu: Object.freeze(["cpuPercent"]),
+  memory: Object.freeze([
+    "memoryPssMb",
+    "memoryJavaHeapKb",
+    "memoryNativeHeapKb",
+  ]),
+  frame: Object.freeze(["frameTimeMs"]),
+});
+
+export const PERFORMANCE_MEMORY_CHART_SERIES = Object.freeze([
+  Object.freeze({
+    key: "memoryPssMb",
+    label: "PSS",
+    unit: " MB",
+    color: "#438cf0",
+    scale: 1,
+  }),
+  Object.freeze({
+    key: "memoryJavaHeapKb",
+    label: "Java Heap",
+    unit: " MB",
+    color: "#0d7965",
+    scale: 1 / 1024,
+  }),
+  Object.freeze({
+    key: "memoryNativeHeapKb",
+    label: "Native Heap",
+    unit: " MB",
+    color: "#d97832",
+    scale: 1 / 1024,
+  }),
+]);
+
+const MEMORY_SAMPLE_FIELDS = PERFORMANCE_CHART_SERIES_FIELDS.memory;
+
 const PHASE_LABELS = Object.freeze({
   loading: "正在准备浏览器连接能力",
   unsupported: "当前浏览器不可用",
@@ -84,9 +120,18 @@ function finite(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+export function memoryKilobytesToMegabytes(value) {
+  const kilobytes = finite(value);
+  return kilobytes === null ? null : kilobytes / 1024;
+}
+
 function formatNumber(value, digits = 1, suffix = "") {
   const number = finite(value);
   return number === null ? "—" : `${number.toFixed(digits)}${suffix}`;
+}
+
+function formatMemoryKilobytes(value) {
+  return formatNumber(memoryKilobytesToMegabytes(value), 1, " MB");
 }
 
 function formatBytes(value) {
@@ -236,12 +281,17 @@ function normalizePerformanceMetricSamples(source) {
   return samples;
 }
 
-export function selectPerformanceChartSamples(samples, field) {
-  if (!Object.values(PERFORMANCE_CHART_FIELDS).includes(field)) {
+export function selectPerformanceChartSamples(samples, fieldOrFields) {
+  const fields = Array.isArray(fieldOrFields) ? fieldOrFields : [fieldOrFields];
+  const knownFields = new Set(Object.values(PERFORMANCE_CHART_SERIES_FIELDS).flat());
+  if (
+    fields.length === 0 ||
+    fields.some((field) => !knownFields.has(field))
+  ) {
     throw new TypeError("未知的性能图表字段");
   }
   return normalizePerformanceMetricSamples(samples)
-    .filter((sample) => finite(sample[field]) !== null);
+    .filter((sample) => fields.some((field) => finite(sample[field]) !== null));
 }
 
 function latestFieldValue(samples, field) {
@@ -308,12 +358,31 @@ export function getPerformanceCpuStatusLabel({
   return "CPU 状态更新";
 }
 
+export function getPerformanceMemoryStatusLabel(rawSample = {}) {
+  const diagnostics = rawSample?.diagnostics;
+  if (
+    diagnostics?.partial === true ||
+    Number(diagnostics?.failedProcessCount) > 0
+  ) {
+    return "部分进程数据";
+  }
+  if (Array.isArray(diagnostics?.missingFields) && diagnostics.missingFields.length > 0) {
+    return "部分分类不可用";
+  }
+  if (rawSample?.status === "unsupported") return "设备不支持";
+  if (rawSample?.status === "degraded") return "已降级采集";
+  if (rawSample?.status === "temporarily-unavailable") return "暂时无数据";
+  return "采集中";
+}
+
 export function createPerformanceReportView(report) {
   const samples = normalizePerformanceMetricSamples(report?.samples);
   const charts = Object.fromEntries(
-    Object.entries(PERFORMANCE_CHART_FIELDS).map(([key, field]) => [
+    Object.entries(PERFORMANCE_CHART_SERIES_FIELDS).map(([key, fields]) => [
       key,
-      samples.filter((sample) => finite(sample[field]) !== null),
+      samples.filter(
+        (sample) => fields.some((field) => finite(sample[field]) !== null),
+      ),
     ]),
   );
   const latest = Object.fromEntries(
@@ -322,6 +391,16 @@ export function createPerformanceReportView(report) {
       latestFieldValue(samples, field),
     ]),
   );
+  const latestMemorySample = [...samples]
+    .reverse()
+    .find(
+      (sample) =>
+        sample.metric === "memory" ||
+        MEMORY_SAMPLE_FIELDS.some((field) => finite(sample[field]) !== null),
+    );
+  for (const field of MEMORY_SAMPLE_FIELDS) {
+    latest[field] = finite(latestMemorySample?.[field]);
+  }
   latest.cpuRawPercent = latestFieldValue(samples, "cpuRawPercent");
   latest.networkTotalBytes = finite(report?.summary?.networkDelta?.totalBytes);
   const cpuSource = latestCpuSource(samples, report);
@@ -407,7 +486,7 @@ function createMarkup() {
         <div class="performance-section-heading"><div><p class="eyebrow">实时采样</p><h2 id="performance-live-title">性能概览</h2></div><span>缺失项显示“—”，不会伪装成 0</span></div>
         <div class="performance-metric-grid">
           ${metricCard("cpu", "应用 CPU", "整机占比", "%")}
-          ${metricCard("memory", "PSS 内存", "目标全部进程", "MB")}
+          ${memoryMetricCard()}
           ${metricCard("fps", "活动渲染 FPS", "仅有新帧时估算", "FPS")}
           ${metricCard("jank", "卡顿率", "按设备刷新预算", "%")}
           ${metricCard("network", "网络区间流量", "开始与结束快照", "RX + TX")}
@@ -415,7 +494,7 @@ function createMarkup() {
         </div>
         <div class="performance-chart-grid">
           ${chartCard("cpu", "CPU 曲线", "整机占比 0–100%")}
-          ${chartCard("memory", "PSS 内存曲线", "目标进程合计")}
+          ${chartCard("memory", "App 内存曲线", "PSS 总内存与堆分类")}
           ${chartCard("frame", "帧耗时曲线", "普通 View/HWUI App")}
         </div>
       </section>
@@ -456,6 +535,25 @@ function metricCard(key, title, hint, unit) {
     <strong data-metric-value="${key}">—</strong>
     <span class="performance-metric-unit">${unit}</span>
     <p data-metric-status="${key}">等待测试</p>
+  </article>`;
+}
+
+function memoryMetricCard() {
+  return `<article class="performance-metric-card performance-memory-card" data-metric-card="memory">
+    <div><span class="performance-metric-label">App 内存</span><small>PSS 总内存 · 目标全部进程</small></div>
+    <strong data-metric-value="memory">—</strong>
+    <span class="performance-metric-unit">MB</span>
+    <div class="performance-memory-breakdown" aria-label="App 内存分类">
+      <span class="performance-memory-breakdown-item is-java">
+        <span>Java Heap</span>
+        <strong data-memory-value="java">—</strong>
+      </span>
+      <span class="performance-memory-breakdown-item is-native">
+        <span>Native Heap</span>
+        <strong data-memory-value="native">—</strong>
+      </span>
+    </div>
+    <p data-metric-status="memory">等待测试</p>
   </article>`;
 }
 
@@ -601,7 +699,10 @@ export function createAndroidPerformanceTool({
   function resetMetrics({ starting = false } = {}) {
     runtime.latest = {};
     runtime.samples = [];
-    for (const [key] of Object.entries(METRIC_PRESENTATION)) updateMetric(key, null, "等待测试");
+    for (const [key] of Object.entries(METRIC_PRESENTATION)) {
+      if (key !== "memory") updateMetric(key, null, "等待测试");
+    }
+    updateMemoryMetric(null, "等待测试");
     if (starting) updateMetric("cpu", null, "等待首个 CPU 样本");
     for (const chart of Object.values(runtime.charts)) chart.setSamples([]);
     for (const node of runtime.root?.querySelectorAll("[data-chart-latest]") ?? []) node.textContent = "—";
@@ -618,12 +719,35 @@ export function createAndroidPerformanceTool({
     card?.classList.toggle("is-unavailable", finite(value) === null);
   }
 
+  function updateMemoryMetric(sample, status = "采集中") {
+    if (!runtime.mounted) return;
+    const pss = finite(sample?.memoryPssMb);
+    const javaHeap = finite(sample?.memoryJavaHeapKb);
+    const nativeHeap = finite(sample?.memoryNativeHeapKb);
+    const pssNode = runtime.root.querySelector('[data-metric-value="memory"]');
+    const javaNode = runtime.root.querySelector('[data-memory-value="java"]');
+    const nativeNode = runtime.root.querySelector('[data-memory-value="native"]');
+    const statusNode = runtime.root.querySelector('[data-metric-status="memory"]');
+    const card = runtime.root.querySelector('[data-metric-card="memory"]');
+    if (pssNode) pssNode.textContent = formatNumber(pss, 1);
+    if (javaNode) javaNode.textContent = formatMemoryKilobytes(javaHeap);
+    if (nativeNode) nativeNode.textContent = formatMemoryKilobytes(nativeHeap);
+    if (statusNode) statusNode.textContent = status;
+    card?.classList.toggle(
+      "is-unavailable",
+      pss === null && javaHeap === null && nativeHeap === null,
+    );
+  }
+
   function metricStateLabel(rawSample) {
     if (rawSample?.metric === "cpu") {
       return getPerformanceCpuStatusLabel({
         source: rawSample.source,
         status: rawSample.status,
       });
+    }
+    if (rawSample?.metric === "memory" || rawSample?.source === "meminfo") {
+      return getPerformanceMemoryStatusLabel(rawSample);
     }
     if (rawSample?.status === "unsupported") return "设备不支持";
     if (rawSample?.status === "degraded") return "已降级采集";
@@ -643,12 +767,21 @@ export function createAndroidPerformanceTool({
 
     const status = metricStateLabel(rawSample);
     for (const [key, presentation] of Object.entries(METRIC_PRESENTATION)) {
-      if (key === "network") continue;
+      if (key === "network" || key === "memory") continue;
       const value = sample[presentation.field];
       if (value !== null) {
         runtime.latest[presentation.field] = value;
         updateMetric(key, value, status);
       }
+    }
+    const isMemorySample = (
+      sample.metric === "memory" ||
+      rawSample?.source === "meminfo" ||
+      MEMORY_SAMPLE_FIELDS.some((field) => finite(sample[field]) !== null)
+    );
+    if (isMemorySample) {
+      for (const field of MEMORY_SAMPLE_FIELDS) runtime.latest[field] = finite(sample[field]);
+      updateMemoryMetric(sample, status);
     }
     if (sample.cpuPercent === null && sample.cpuRawPercent !== null) {
       runtime.latest.cpuRawPercent = sample.cpuRawPercent;
@@ -661,13 +794,17 @@ export function createAndroidPerformanceTool({
     }
 
     if (sample.cpuPercent !== null) runtime.charts.cpu?.appendSample(sample);
-    if (sample.memoryPssMb !== null) runtime.charts.memory?.appendSample(sample);
+    if (MEMORY_SAMPLE_FIELDS.some((field) => finite(sample[field]) !== null)) {
+      runtime.charts.memory?.appendSample(sample);
+    }
     if (sample.frameTimeMs !== null) runtime.charts.frame?.appendSample(sample);
     const cpuLatest = runtime.root.querySelector('[data-chart-latest="cpu"]');
     const memoryLatest = runtime.root.querySelector('[data-chart-latest="memory"]');
     const frameLatest = runtime.root.querySelector('[data-chart-latest="frame"]');
     if (sample.cpuPercent !== null && cpuLatest) cpuLatest.textContent = formatNumber(sample.cpuPercent, 1, "%");
-    if (sample.memoryPssMb !== null && memoryLatest) memoryLatest.textContent = formatNumber(sample.memoryPssMb, 1, " MB");
+    if (isMemorySample && memoryLatest) {
+      memoryLatest.textContent = formatNumber(sample.memoryPssMb, 1, " MB");
+    }
     if (sample.frameTimeMs !== null && frameLatest) frameLatest.textContent = formatNumber(sample.frameTimeMs, 1, " ms");
   }
 
@@ -758,6 +895,21 @@ export function createAndroidPerformanceTool({
     return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(hint)}</small></div>`;
   }
 
+  function reportMemoryMetric(summary) {
+    const pss = summary?.memoryPssMb || {};
+    const javaHeap = summary?.memoryJavaHeapKb || {};
+    const nativeHeap = summary?.memoryNativeHeapKb || {};
+    return `<div class="performance-report-memory">
+      <span>App 内存</span>
+      <strong>${escapeHtml(formatNumber(pss.average, 1, " MB"))}</strong>
+      <small>PSS 平均 · 峰值 ${escapeHtml(formatNumber(pss.maximum, 1, " MB"))}</small>
+      <div class="performance-report-memory-breakdown">
+        <span class="is-java"><span>Java Heap</span><b>平均 ${escapeHtml(formatMemoryKilobytes(javaHeap.average))}</b><small>峰值 ${escapeHtml(formatMemoryKilobytes(javaHeap.maximum))}</small></span>
+        <span class="is-native"><span>Native Heap</span><b>平均 ${escapeHtml(formatMemoryKilobytes(nativeHeap.average))}</b><small>峰值 ${escapeHtml(formatMemoryKilobytes(nativeHeap.maximum))}</small></span>
+      </div>
+    </div>`;
+  }
+
   function renderCurrentReport() {
     if (!runtime.mounted || !runtime.currentReport) return;
     const report = runtime.currentReport;
@@ -770,7 +922,7 @@ export function createAndroidPerformanceTool({
       </div>
       <div class="performance-report-summary">
         ${reportMetric("平均 CPU", formatNumber(summary.cpuPercent?.average, 1, "%"), `峰值 ${formatNumber(summary.cpuPercent?.maximum, 1, "%")}`)}
-        ${reportMetric("平均 PSS", formatNumber(summary.memoryPssMb?.average, 1, " MB"), `峰值 ${formatNumber(summary.memoryPssMb?.maximum, 1, " MB")}`)}
+        ${reportMemoryMetric(summary)}
         ${reportMetric("帧耗时 P95", formatNumber(summary.frames?.frameP95Ms ?? summary.frameTimeMs?.p95, 1, " ms"), `卡顿率 ${formatNumber(summary.frames?.jankRate ?? summary.jankRate?.average, 1, "%")}`)}
         ${reportMetric("网络增量", formatBytes(summary.networkDelta?.totalBytes), "RX + TX 区间差值")}
         ${reportMetric("最高电池温度", formatNumber(summary.batteryTemperatureC?.maximum, 1, " °C"), "设备电池传感器")}
@@ -788,6 +940,7 @@ export function createAndroidPerformanceTool({
     runtime.latest = { ...view.latest };
 
     for (const [key, presentation] of Object.entries(METRIC_PRESENTATION)) {
+      if (key === "memory") continue;
       const value = key === "network"
         ? view.latest.networkTotalBytes
         : view.latest[presentation.field];
@@ -804,6 +957,13 @@ export function createAndroidPerformanceTool({
           : "报告最终值";
       updateMetric(key, value, status);
     }
+    const hasMemoryValue = MEMORY_SAMPLE_FIELDS.some(
+      (field) => finite(view.latest[field]) !== null,
+    );
+    updateMemoryMetric(
+      view.latest,
+      hasMemoryValue ? "报告最终值" : "报告无数据",
+    );
     if (view.cpuUsesRawValue) {
       updateMetric("cpu", view.latest.cpuRawPercent, "原始核占用，未归一化");
     }
@@ -1150,8 +1310,8 @@ export function createAndroidPerformanceTool({
       windowMs: CHART_WINDOW_MS,
     });
     runtime.charts.memory = createPerformanceChart(runtime.root.querySelector('[data-performance-chart="memory"]'), {
-      title: "PSS 内存曲线",
-      series: [{ key: "memoryPssMb", label: "PSS", unit: " MB", color: "#438cf0" }],
+      title: "App 内存曲线",
+      series: PERFORMANCE_MEMORY_CHART_SERIES,
       minimum: 0,
       windowMs: CHART_WINDOW_MS,
     });
