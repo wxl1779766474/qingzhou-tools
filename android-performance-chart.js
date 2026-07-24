@@ -5,6 +5,15 @@ import {
 } from "./android-performance-core.js";
 
 const DEFAULT_WINDOW_MS = 10 * 60 * 1_000;
+const CHART_PADDING = Object.freeze({
+  top: 42,
+  right: 18,
+  bottom: 30,
+  left: 48,
+});
+const TOOLTIP_MARGIN = 8;
+const TOOLTIP_GAP = 12;
+const TOOLTIP_LINE_HEIGHT = 18;
 
 const DEFAULT_SERIES = Object.freeze([
   Object.freeze({
@@ -186,6 +195,11 @@ function formatNumber(value) {
   return value.toFixed(2);
 }
 
+function formatHoverNumber(value) {
+  if (!Number.isFinite(value)) return "--";
+  return String(Number(value.toFixed(2)));
+}
+
 function formatElapsed(milliseconds) {
   if (!Number.isFinite(milliseconds) || milliseconds < 0) return "0s";
   const seconds = Math.round(milliseconds / 1_000);
@@ -193,6 +207,85 @@ function formatElapsed(milliseconds) {
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
   return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+function findNearestSample(points, targetTimestamp) {
+  if (!points.length || !Number.isFinite(targetTimestamp)) return null;
+  let nearest = points[0];
+  let nearestDistance = Math.abs(nearest.timestamp - targetTimestamp);
+
+  for (const point of points.slice(1)) {
+    const distance = Math.abs(point.timestamp - targetTimestamp);
+    if (
+      distance < nearestDistance ||
+      (
+        distance === nearestDistance &&
+        compareSamples(point, nearest) < 0
+      )
+    ) {
+      nearest = point;
+      nearestDistance = distance;
+    }
+  }
+
+  return nearest;
+}
+
+function clamp(value, minimum, maximum) {
+  return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+}
+
+function positionTooltip({
+  anchorX,
+  anchorY,
+  canvasHeight,
+  canvasWidth,
+  height,
+  width,
+}) {
+  const safeWidth = Math.min(width, Math.max(1, canvasWidth - TOOLTIP_MARGIN * 2));
+  const safeHeight = Math.min(height, Math.max(1, canvasHeight - TOOLTIP_MARGIN * 2));
+  let x = anchorX + TOOLTIP_GAP;
+  let y = anchorY - safeHeight - TOOLTIP_GAP;
+
+  if (x + safeWidth > canvasWidth - TOOLTIP_MARGIN) {
+    x = anchorX - safeWidth - TOOLTIP_GAP;
+  }
+  if (y < TOOLTIP_MARGIN) {
+    y = anchorY + TOOLTIP_GAP;
+  }
+
+  return {
+    height: safeHeight,
+    width: safeWidth,
+    x: clamp(x, TOOLTIP_MARGIN, canvasWidth - safeWidth - TOOLTIP_MARGIN),
+    y: clamp(y, TOOLTIP_MARGIN, canvasHeight - safeHeight - TOOLTIP_MARGIN),
+  };
+}
+
+function roundedRectangle(context, x, y, width, height, radius) {
+  context.beginPath();
+  if (typeof context.roundRect === "function") {
+    context.roundRect(x, y, width, height, radius);
+    return;
+  }
+
+  const safeRadius = Math.min(radius, width / 2, height / 2);
+  context.moveTo(x + safeRadius, y);
+  context.lineTo(x + width - safeRadius, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + safeRadius);
+  context.lineTo(x + width, y + height - safeRadius);
+  context.quadraticCurveTo(
+    x + width,
+    y + height,
+    x + width - safeRadius,
+    y + height,
+  );
+  context.lineTo(x + safeRadius, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - safeRadius);
+  context.lineTo(x, y + safeRadius);
+  context.quadraticCurveTo(x, y, x + safeRadius, y);
+  context.closePath();
 }
 
 function schedule(callback) {
@@ -230,9 +323,80 @@ export function createPerformanceChart(canvas, options = {}) {
   let scheduledDraw = null;
   let cssWidth = defaultWidth;
   let cssHeight = defaultHeight;
+  let pointerClientPosition = null;
 
   canvas.setAttribute?.("role", "img");
   canvas.setAttribute?.("aria-label", `${title}，暂无数据`);
+
+  function getPointerCanvasPosition() {
+    if (!pointerClientPosition) return null;
+    const rectangle = typeof canvas.getBoundingClientRect === "function"
+      ? canvas.getBoundingClientRect()
+      : null;
+    const rectangleWidth = Number.isFinite(rectangle?.width) && rectangle.width > 0
+      ? rectangle.width
+      : cssWidth;
+    const rectangleHeight = Number.isFinite(rectangle?.height) && rectangle.height > 0
+      ? rectangle.height
+      : cssHeight;
+    const rectangleLeft = Number.isFinite(rectangle?.left) ? rectangle.left : 0;
+    const rectangleTop = Number.isFinite(rectangle?.top) ? rectangle.top : 0;
+    return {
+      x: ((pointerClientPosition.x - rectangleLeft) / rectangleWidth) * cssWidth,
+      y: ((pointerClientPosition.y - rectangleTop) / rectangleHeight) * cssHeight,
+    };
+  }
+
+  function isInsidePlot(position) {
+    return Boolean(
+      position &&
+      Number.isFinite(position.x) &&
+      Number.isFinite(position.y) &&
+      position.x >= CHART_PADDING.left &&
+      position.x <= cssWidth - CHART_PADDING.right &&
+      position.y >= CHART_PADDING.top &&
+      position.y <= cssHeight - CHART_PADDING.bottom,
+    );
+  }
+
+  function clearPointer() {
+    if (!pointerClientPosition) return;
+    pointerClientPosition = null;
+    requestDraw();
+  }
+
+  function handlePointerMove(event) {
+    if (
+      destroyed ||
+      !Number.isFinite(event?.clientX) ||
+      !Number.isFinite(event?.clientY)
+    ) {
+      clearPointer();
+      return;
+    }
+
+    const nextPosition = {
+      x: event.clientX,
+      y: event.clientY,
+    };
+    const previousPosition = pointerClientPosition;
+    pointerClientPosition = nextPosition;
+    if (!isInsidePlot(getPointerCanvasPosition())) {
+      pointerClientPosition = null;
+      if (previousPosition) requestDraw();
+      return;
+    }
+    requestDraw();
+  }
+
+  function handlePointerExit() {
+    if (destroyed) return;
+    clearPointer();
+  }
+
+  function setHoverActive(active) {
+    canvas.classList?.toggle("is-performance-chart-hovering", Boolean(active));
+  }
 
   function resize() {
     if (destroyed) return;
@@ -262,12 +426,192 @@ export function createPerformanceChart(canvas, options = {}) {
   }
 
   function drawEmptyState() {
+    setHoverActive(false);
     canvas.setAttribute?.("aria-label", `${title}，暂无数据`);
     context.fillStyle = options.mutedColor ?? "#607571";
     context.font = '13px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
     context.textAlign = "center";
     context.textBaseline = "middle";
     context.fillText(emptyText, cssWidth / 2, cssHeight / 2);
+  }
+
+  function drawHoverLayer({
+    duration,
+    maximum,
+    plotHeight,
+    plotWidth,
+    points,
+    range,
+    startedAt,
+  }) {
+    const pointer = getPointerCanvasPosition();
+    if (!isInsidePlot(pointer)) return false;
+
+    const targetTimestamp = startedAt +
+      ((pointer.x - CHART_PADDING.left) / plotWidth) * duration;
+    const selectedSample = findNearestSample(points, targetTimestamp);
+    if (!selectedSample) return false;
+
+    const selectedX = CHART_PADDING.left +
+      ((selectedSample.timestamp - startedAt) / duration) * plotWidth;
+    const selectedSeries = series.flatMap((item) => {
+      const value = selectedSample[item.key];
+      if (!Number.isFinite(value)) return [];
+      const rawY = CHART_PADDING.top +
+        ((maximum - value) / range) * plotHeight;
+      return [{
+        item,
+        value,
+        y: clamp(
+          rawY,
+          CHART_PADDING.top,
+          CHART_PADDING.top + plotHeight,
+        ),
+      }];
+    });
+    if (!selectedSeries.length) return false;
+
+    context.beginPath();
+    context.strokeStyle = options.hoverGuideColor ?? "rgba(13, 121, 101, 0.34)";
+    context.lineWidth = 1;
+    context.moveTo(selectedX, CHART_PADDING.top);
+    context.lineTo(selectedX, CHART_PADDING.top + plotHeight);
+    context.stroke();
+
+    for (const entry of selectedSeries) {
+      context.beginPath();
+      context.fillStyle = options.hoverPointRingColor ?? "#ffffff";
+      context.arc(selectedX, entry.y, 6, 0, Math.PI * 2);
+      context.fill();
+
+      context.beginPath();
+      context.fillStyle = entry.item.color;
+      context.arc(selectedX, entry.y, 4, 0, Math.PI * 2);
+      context.fill();
+    }
+
+    const timeText = `测试时间 ${formatElapsed(selectedSample.timestamp - startedAt)}`;
+    const metricLines = selectedSeries.map((entry) => ({
+      color: entry.item.color,
+      text: `${entry.item.label} ${formatHoverNumber(entry.value)}${entry.item.unit}`,
+    }));
+    context.font = '600 12px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    const maximumTooltipHeight = Math.max(
+      1,
+      cssHeight - TOOLTIP_MARGIN * 2,
+    );
+    const rowsPerColumn = Math.max(
+      1,
+      Math.floor(
+        (maximumTooltipHeight - 14) / TOOLTIP_LINE_HEIGHT,
+      ) - 1,
+    );
+    const columnCount = Math.ceil(metricLines.length / rowsPerColumn);
+    const naturalColumnWidths = Array.from(
+      { length: columnCount },
+      (_, columnIndex) => {
+        const columnLines = metricLines.slice(
+          columnIndex * rowsPerColumn,
+          (columnIndex + 1) * rowsPerColumn,
+        );
+        return Math.max(
+          24,
+          ...columnLines.map((line) => context.measureText(line.text).width + 14),
+        );
+      },
+    );
+    const preferredColumnGap = columnCount > 1 ? 12 : 0;
+    const naturalColumnsWidth = naturalColumnWidths.reduce(
+      (total, width) => total + width,
+      0,
+    ) + preferredColumnGap * Math.max(0, columnCount - 1);
+    const tooltipWidth = Math.max(
+      88,
+      context.measureText(timeText).width + 20,
+      naturalColumnsWidth + 20,
+    );
+    const tooltipHeight = 14 +
+      (
+        1 +
+        Math.min(metricLines.length, rowsPerColumn)
+      ) * TOOLTIP_LINE_HEIGHT;
+    const tooltip = positionTooltip({
+      anchorX: selectedX,
+      anchorY: Math.min(...selectedSeries.map((entry) => entry.y)),
+      canvasHeight: cssHeight,
+      canvasWidth: cssWidth,
+      height: tooltipHeight,
+      width: tooltipWidth,
+    });
+    const innerWidth = Math.max(1, tooltip.width - 20);
+    const columnGap = columnCount > 1
+      ? Math.min(
+          preferredColumnGap,
+          innerWidth / (columnCount * 2),
+        )
+      : 0;
+    const columnWidthBudget = Math.max(
+      1,
+      innerWidth - columnGap * Math.max(0, columnCount - 1),
+    );
+    const naturalColumnWidthTotal = naturalColumnWidths.reduce(
+      (total, width) => total + width,
+      0,
+    );
+    const columnScale = Math.min(
+      1,
+      columnWidthBudget / Math.max(1, naturalColumnWidthTotal),
+    );
+    const columnWidths = naturalColumnWidths.map(
+      (width) => width * columnScale,
+    );
+    const columnOffsets = columnWidths.map((_, columnIndex) => (
+      columnWidths
+        .slice(0, columnIndex)
+        .reduce((total, width) => total + width, 0) +
+      columnGap * columnIndex
+    ));
+
+    roundedRectangle(
+      context,
+      tooltip.x,
+      tooltip.y,
+      tooltip.width,
+      tooltip.height,
+      8,
+    );
+    context.fillStyle = options.tooltipBackgroundColor ?? "rgba(23, 49, 45, 0.96)";
+    context.fill();
+    context.strokeStyle = options.tooltipBorderColor ?? "rgba(255, 255, 255, 0.14)";
+    context.lineWidth = 1;
+    context.stroke();
+
+    context.textAlign = "left";
+    context.textBaseline = "middle";
+    context.fillStyle = options.tooltipMutedColor ?? "#c8ddd8";
+    context.fillText(
+      timeText,
+      tooltip.x + 10,
+      tooltip.y + 13,
+      Math.max(1, tooltip.width - 20),
+    );
+    for (let index = 0; index < metricLines.length; index += 1) {
+      const line = metricLines[index];
+      const columnIndex = Math.floor(index / rowsPerColumn);
+      const rowIndex = index % rowsPerColumn;
+      const x = tooltip.x + 10 + columnOffsets[columnIndex];
+      const y = tooltip.y + 13 + (rowIndex + 1) * TOOLTIP_LINE_HEIGHT;
+      context.fillStyle = line.color;
+      context.fillRect(x, y - 2, 8, 4);
+      context.fillStyle = options.tooltipTextColor ?? "#ffffff";
+      context.fillText(
+        line.text,
+        x + 14,
+        y,
+        Math.max(1, columnWidths[columnIndex] - 14),
+      );
+    }
+    return true;
   }
 
   function draw() {
@@ -283,7 +627,7 @@ export function createPerformanceChart(canvas, options = {}) {
       return;
     }
 
-    const padding = { top: 42, right: 18, bottom: 30, left: 48 };
+    const padding = CHART_PADDING;
     const plotWidth = Math.max(1, cssWidth - padding.left - padding.right);
     const plotHeight = Math.max(1, cssHeight - padding.top - padding.bottom);
     let minimum = Number.isFinite(options.minimum) ? options.minimum : Math.min(...values);
@@ -364,6 +708,16 @@ export function createPerformanceChart(canvas, options = {}) {
       context.fill();
     }
 
+    setHoverActive(drawHoverLayer({
+      duration,
+      maximum,
+      plotHeight,
+      plotWidth,
+      points,
+      range,
+      startedAt,
+    }));
+
     const accessibleSummary = series.map((item) => {
       const latestSample = [...points].reverse().find((sample) => sample[item.key] !== null);
       const latest = latestSample?.[item.key] ?? null;
@@ -395,6 +749,10 @@ export function createPerformanceChart(canvas, options = {}) {
     requestDraw();
   }
 
+  canvas.addEventListener?.("pointermove", handlePointerMove);
+  canvas.addEventListener?.("pointerleave", handlePointerExit);
+  canvas.addEventListener?.("pointercancel", handlePointerExit);
+
   const resizeObserver = options.autoResize !== false && typeof globalThis.ResizeObserver === "function"
     ? new globalThis.ResizeObserver(resize)
     : null;
@@ -413,6 +771,11 @@ export function createPerformanceChart(canvas, options = {}) {
       cancelSchedule(scheduledDraw);
       scheduledDraw = null;
       resizeObserver?.disconnect();
+      pointerClientPosition = null;
+      setHoverActive(false);
+      canvas.removeEventListener?.("pointermove", handlePointerMove);
+      canvas.removeEventListener?.("pointerleave", handlePointerExit);
+      canvas.removeEventListener?.("pointercancel", handlePointerExit);
     },
   };
 }
