@@ -2,7 +2,7 @@ import {
   appendPerformanceSample,
   downsamplePerformanceSamples,
   normalizePerformanceSample,
-} from "./android-performance-core.js";
+} from "./android-performance-core.js?v=20260724-memory-v3";
 
 const DEFAULT_WINDOW_MS = 10 * 60 * 1_000;
 const CHART_PADDING = Object.freeze({
@@ -341,6 +341,7 @@ export function createPerformanceChart(canvas, options = {}) {
   const defaultHeight = Math.max(160, Number(options.height) || 260);
   const emptyText = String(options.emptyText ?? "开始测试后显示实时曲线");
   const title = String(options.title ?? series.map((item) => item.label).join(" / "));
+  const showLegend = options.showLegend !== false;
   let samples = [];
   let destroyed = false;
   let scheduledDraw = null;
@@ -690,18 +691,20 @@ export function createPerformanceChart(canvas, options = {}) {
     context.textAlign = "right";
     context.fillText(formatElapsed(endedAt - startedAt), padding.left + plotWidth, cssHeight - 8);
 
-    let legendX = padding.left;
-    context.textAlign = "left";
-    context.textBaseline = "middle";
     const latestSample = points.at(-1);
-    for (const item of series) {
-      const latest = getSeriesValue(latestSample, item);
-      context.fillStyle = item.color;
-      context.fillRect(legendX, 15, 10, 3);
-      context.fillStyle = options.textColor ?? "#17312d";
-      const legend = `${item.label} ${formatNumber(latest)}${latest === null ? "" : item.unit}`;
-      context.fillText(legend, legendX + 16, 17);
-      legendX += Math.min(180, context.measureText(legend).width + 38);
+    if (showLegend) {
+      let legendX = padding.left;
+      context.textAlign = "left";
+      context.textBaseline = "middle";
+      for (const item of series) {
+        const latest = getSeriesValue(latestSample, item);
+        context.fillStyle = item.color;
+        context.fillRect(legendX, 15, 10, 3);
+        context.fillStyle = options.textColor ?? "#17312d";
+        const legend = `${item.label} ${formatNumber(latest)}${latest === null ? "" : item.unit}`;
+        context.fillText(legend, legendX + 16, 17);
+        legendX += Math.min(180, context.measureText(legend).width + 38);
+      }
     }
 
     for (const item of series) {
