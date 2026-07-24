@@ -33,31 +33,44 @@ function normalizeSeries(series) {
     if (!item || typeof item.key !== "string" || !item.key) {
       throw new TypeError("图表指标 key 无效");
     }
+    const scale = item.scale === undefined ? 1 : item.scale;
+    if (
+      typeof scale !== "number" ||
+      !Number.isFinite(scale) ||
+      scale <= 0
+    ) {
+      throw new TypeError("图表指标 scale 必须是有限正数");
+    }
     return {
       key: item.key,
       label: String(item.label ?? item.key),
       unit: String(item.unit ?? ""),
       color: String(item.color ?? ["#0d7965", "#438cf0", "#d97832"][index % 3]),
+      scale,
     };
   });
+}
+
+function getSeriesValue(sample, item) {
+  const rawValue = sample?.[item.key];
+  if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) return null;
+  const value = rawValue * item.scale;
+  return Number.isFinite(value) ? value : null;
 }
 
 function finiteValues(samples, series) {
   const values = [];
   for (const sample of samples) {
     for (const item of series) {
-      const value = sample[item.key];
-      if (typeof value === "number" && Number.isFinite(value)) values.push(value);
+      const value = getSeriesValue(sample, item);
+      if (value !== null) values.push(value);
     }
   }
   return values;
 }
 
 function hasSeriesValue(sample, series) {
-  return series.some((item) => {
-    const value = sample[item.key];
-    return typeof value === "number" && Number.isFinite(value);
-  });
+  return series.some((item) => getSeriesValue(sample, item) !== null);
 }
 
 function normalizeWindowMs(value) {
@@ -99,11 +112,11 @@ function sampleProminence(sample, first, last, series) {
   let prominence = 0;
 
   for (const item of series) {
-    const value = sample[item.key];
-    if (!Number.isFinite(value)) continue;
-    const firstValue = first[item.key];
-    const lastValue = last[item.key];
-    const expected = Number.isFinite(firstValue) && Number.isFinite(lastValue)
+    const value = getSeriesValue(sample, item);
+    if (value === null) continue;
+    const firstValue = getSeriesValue(first, item);
+    const lastValue = getSeriesValue(last, item);
+    const expected = firstValue !== null && lastValue !== null
       ? firstValue + (lastValue - firstValue) * elapsedRatio
       : 0;
     prominence = Math.max(prominence, Math.abs(value - expected));
@@ -120,10 +133,20 @@ function selectBucketSamples(bucket, series) {
     let minimum = null;
     let maximum = null;
     for (const sample of bucket) {
-      const value = sample[item.key];
-      if (!Number.isFinite(value)) continue;
-      if (minimum === null || value < minimum[item.key]) minimum = sample;
-      if (maximum === null || value > maximum[item.key]) maximum = sample;
+      const value = getSeriesValue(sample, item);
+      if (value === null) continue;
+      if (
+        minimum === null ||
+        value < getSeriesValue(minimum, item)
+      ) {
+        minimum = sample;
+      }
+      if (
+        maximum === null ||
+        value > getSeriesValue(maximum, item)
+      ) {
+        maximum = sample;
+      }
     }
     if (minimum) selected.add(minimum);
     if (maximum) selected.add(maximum);
@@ -189,14 +212,14 @@ function downsampleChartSamples(samples, series, maxPoints) {
 }
 
 function formatNumber(value) {
-  if (value === null || value === undefined || !Number.isFinite(value)) return "--";
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
   if (Math.abs(value) >= 100) return String(Math.round(value));
   if (Math.abs(value) >= 10) return value.toFixed(1);
   return value.toFixed(2);
 }
 
 function formatHoverNumber(value) {
-  if (!Number.isFinite(value)) return "--";
+  if (!Number.isFinite(value)) return "—";
   return String(Number(value.toFixed(2)));
 }
 
@@ -454,9 +477,12 @@ export function createPerformanceChart(canvas, options = {}) {
 
     const selectedX = CHART_PADDING.left +
       ((selectedSample.timestamp - startedAt) / duration) * plotWidth;
-    const selectedSeries = series.flatMap((item) => {
-      const value = selectedSample[item.key];
-      if (!Number.isFinite(value)) return [];
+    const selectedValues = series.map((item) => ({
+      item,
+      value: getSeriesValue(selectedSample, item),
+    }));
+    const selectedSeries = selectedValues.flatMap(({ item, value }) => {
+      if (value === null) return [];
       const rawY = CHART_PADDING.top +
         ((maximum - value) / range) * plotHeight;
       return [{
@@ -491,9 +517,11 @@ export function createPerformanceChart(canvas, options = {}) {
     }
 
     const timeText = `测试时间 ${formatElapsed(selectedSample.timestamp - startedAt)}`;
-    const metricLines = selectedSeries.map((entry) => ({
-      color: entry.item.color,
-      text: `${entry.item.label} ${formatHoverNumber(entry.value)}${entry.item.unit}`,
+    const metricLines = selectedValues.map(({ item, value }) => ({
+      color: item.color,
+      text: value === null
+        ? `${item.label} —`
+        : `${item.label} ${formatHoverNumber(value)}${item.unit}`,
     }));
     context.font = '600 12px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
     const maximumTooltipHeight = Math.max(
@@ -665,9 +693,9 @@ export function createPerformanceChart(canvas, options = {}) {
     let legendX = padding.left;
     context.textAlign = "left";
     context.textBaseline = "middle";
+    const latestSample = points.at(-1);
     for (const item of series) {
-      const latestSample = [...points].reverse().find((sample) => sample[item.key] !== null);
-      const latest = latestSample?.[item.key] ?? null;
+      const latest = getSeriesValue(latestSample, item);
       context.fillStyle = item.color;
       context.fillRect(legendX, 15, 10, 3);
       context.fillStyle = options.textColor ?? "#17312d";
@@ -677,15 +705,14 @@ export function createPerformanceChart(canvas, options = {}) {
     }
 
     for (const item of series) {
-      const seriesPoints = points
-        .filter((sample) => Number.isFinite(sample[item.key]))
-        .map((sample) => {
-          const value = sample[item.key];
-          return {
-            x: padding.left + ((sample.timestamp - startedAt) / duration) * plotWidth,
-            y: padding.top + ((maximum - value) / range) * plotHeight,
-          };
-        });
+      const seriesPoints = points.flatMap((sample) => {
+        const value = getSeriesValue(sample, item);
+        if (value === null) return [];
+        return {
+          x: padding.left + ((sample.timestamp - startedAt) / duration) * plotWidth,
+          y: padding.top + ((maximum - value) / range) * plotHeight,
+        };
+      });
       if (!seriesPoints.length) continue;
 
       context.beginPath();
@@ -719,8 +746,7 @@ export function createPerformanceChart(canvas, options = {}) {
     }));
 
     const accessibleSummary = series.map((item) => {
-      const latestSample = [...points].reverse().find((sample) => sample[item.key] !== null);
-      const latest = latestSample?.[item.key] ?? null;
+      const latest = getSeriesValue(latestSample, item);
       return `${item.label}${latest === null ? "暂无数据" : `${formatNumber(latest)}${item.unit}`}`;
     }).join("，");
     canvas.setAttribute?.(
