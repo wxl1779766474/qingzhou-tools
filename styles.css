@@ -2417,6 +2417,14 @@ body.dialog-open {
   background: #d97832;
 }
 
+.performance-memory-breakdown-item.is-code::before {
+  background: #7b61d1;
+}
+
+.performance-memory-breakdown-item.is-graphics::before {
+  background: #b64f8c;
+}
+
 .performance-memory-breakdown-item > span {
   overflow: hidden;
   color: var(--muted);
@@ -2436,6 +2444,9 @@ body.dialog-open {
 .performance-chart-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-areas:
+    "cpu frame"
+    "memory memory";
   gap: 12px;
 }
 
@@ -2448,8 +2459,16 @@ body.dialog-open {
   box-shadow: var(--shadow-sm);
 }
 
-.performance-chart-card:last-child {
-  grid-column: 1 / -1;
+[data-performance-chart-card="cpu"] {
+  grid-area: cpu;
+}
+
+[data-performance-chart-card="memory"] {
+  grid-area: memory;
+}
+
+[data-performance-chart-card="frame"] {
+  grid-area: frame;
 }
 
 .performance-chart-card header {
@@ -2491,6 +2510,74 @@ body.dialog-open {
 
 .performance-chart-card canvas.is-performance-chart-hovering {
   cursor: crosshair;
+}
+
+.performance-memory-guide {
+  padding: 13px 14px 14px;
+  border-top: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(247, 251, 250, 0.74), rgba(255, 255, 255, 0.96));
+}
+
+.performance-memory-guide > p {
+  margin: 0 0 11px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.performance-memory-guide dl {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.performance-memory-guide dl > div {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.performance-memory-guide dt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 780;
+}
+
+.performance-memory-guide dt > span {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 999px;
+  background: #438cf0;
+}
+
+.performance-memory-guide .is-java dt > span {
+  background: #0d7965;
+}
+
+.performance-memory-guide .is-native dt > span {
+  background: #d97832;
+}
+
+.performance-memory-guide .is-code dt > span {
+  background: #7b61d1;
+}
+
+.performance-memory-guide .is-graphics dt > span {
+  background: #b64f8c;
+}
+
+.performance-memory-guide dd {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
 }
 
 .performance-report-body {
@@ -2623,6 +2710,14 @@ body.dialog-open {
 
 .performance-report-memory-breakdown > span.is-native::before {
   background: #d97832;
+}
+
+.performance-report-memory-breakdown > span.is-code::before {
+  background: #7b61d1;
+}
+
+.performance-report-memory-breakdown > span.is-graphics::before {
+  background: #b64f8c;
 }
 
 .performance-report-memory-breakdown span,
@@ -2762,10 +2857,14 @@ body.dialog-open {
 
   .performance-chart-grid {
     grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "cpu"
+      "memory"
+      "frame";
   }
 
-  .performance-chart-card:last-child {
-    grid-column: auto;
+  .performance-memory-guide dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -2835,5 +2934,9 @@ body.dialog-open {
 
   .performance-chart-card canvas {
     height: 210px;
+  }
+
+  .performance-memory-guide dl {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
