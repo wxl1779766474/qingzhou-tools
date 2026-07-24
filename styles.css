@@ -2436,6 +2436,10 @@ body.dialog-open {
   display: block;
 }
 
+.performance-chart-card canvas.is-performance-chart-hovering {
+  cursor: crosshair;
+}
+
 .performance-report-body {
   gap: 18px;
 }
