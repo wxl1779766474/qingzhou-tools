@@ -2380,6 +2380,59 @@ body.dialog-open {
   font-size: 10px;
 }
 
+.performance-memory-card {
+  grid-template-rows: auto auto auto auto;
+}
+
+.performance-memory-breakdown {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.performance-memory-breakdown-item {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 8px 8px 8px 18px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(248, 251, 250, 0.8);
+}
+
+.performance-memory-breakdown-item::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  left: 8px;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--mint-dark);
+}
+
+.performance-memory-breakdown-item.is-native::before {
+  background: #d97832;
+}
+
+.performance-memory-breakdown-item > span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.performance-memory-breakdown-item > strong {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
 .performance-chart-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2540,6 +2593,53 @@ body.dialog-open {
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.performance-report-memory-breakdown {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+}
+
+.performance-report-memory-breakdown > span {
+  position: relative;
+  min-width: 0;
+  padding-left: 9px;
+}
+
+.performance-report-memory-breakdown > span::before {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: 0;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--mint-dark);
+}
+
+.performance-report-memory-breakdown > span.is-native::before {
+  background: #d97832;
+}
+
+.performance-report-memory-breakdown span,
+.performance-report-memory-breakdown b,
+.performance-report-memory-breakdown small {
+  overflow: hidden;
+  font-size: 9px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.performance-report-memory-breakdown b {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-soft);
+  font-weight: 750;
 }
 
 .performance-report-notes {
