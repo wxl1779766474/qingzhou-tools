@@ -1,7 +1,7 @@
 import {
   validateAndroidPackageName,
   validateAndroidPid,
-} from "./android-performance-commands.js";
+} from "./android-performance-commands.js?v=20260724-memory-v3";
 
 const NUMBER_PATTERN = "[-+]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)";
 const PACKAGE_IN_TEXT_PATTERN = /([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/gu;
@@ -675,8 +675,10 @@ export function parseMemInfo(text) {
   const rssKb = matchKilobytes(text, /\bTOTAL RSS:\s*([\d,]+)/iu);
   const javaHeapKb = matchKilobytes(text, /^\s*Java Heap:\s*([\d,]+)/imu);
   const nativeHeapKb = matchKilobytes(text, /^\s*Native Heap:\s*([\d,]+)/imu);
+  const codeKb = matchKilobytes(text, /^\s*Code:\s*([\d,]+)/imu);
+  const graphicsKb = matchKilobytes(text, /^\s*Graphics:\s*([\d,]+)/imu);
   return success(
-    { pssKb, rssKb, javaHeapKb, nativeHeapKb },
+    { pssKb, rssKb, javaHeapKb, nativeHeapKb, codeKb, graphicsKb },
     { source: "meminfo" },
   );
 }
