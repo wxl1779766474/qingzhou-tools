@@ -537,6 +537,11 @@ function sumNullable(values, key) {
   return present.length > 0 ? present.reduce((sum, value) => sum + value, 0) : null;
 }
 
+function sumComplete(values, key) {
+  if (values.length === 0 || values.some((value) => !Number.isFinite(value[key]))) return null;
+  return values.reduce((sum, value) => sum + value[key], 0);
+}
+
 async function findTargetProcesses(runner, packageName, uid, options = {}) {
   const signal = options.signal;
   const timeoutMs = options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
@@ -743,17 +748,28 @@ export function createPerformanceSession({ runner, clock, onSample, onStatus } =
       if (snapshot.phase === "running" || options.final) metricFailure("memory", "meminfo_unavailable");
       return;
     }
+    const missingFields = [];
+    if (results.some((value) => !Number.isFinite(value.javaHeapKb))) {
+      missingFields.push("memoryJavaHeapKb");
+    }
+    if (results.some((value) => !Number.isFinite(value.nativeHeapKb))) {
+      missingFields.push("memoryNativeHeapKb");
+    }
+    const diagnostics = {
+      ...(failures > 0 ? { partial: true, failedProcessCount: failures } : {}),
+      ...(missingFields.length > 0 ? { missingFields } : {}),
+    };
     appendSample(
       "memory",
       "meminfo",
       {
         pssKb: sumNullable(results, "pssKb"),
-        javaHeapKb: sumNullable(results, "javaHeapKb"),
-        nativeHeapKb: sumNullable(results, "nativeHeapKb"),
+        javaHeapKb: sumComplete(results, "javaHeapKb"),
+        nativeHeapKb: sumComplete(results, "nativeHeapKb"),
         rssKb: sumNullable(results, "rssKb"),
       },
       totalDuration,
-      failures > 0 ? { partial: true, failedProcessCount: failures } : undefined,
+      Object.keys(diagnostics).length > 0 ? diagnostics : undefined,
     );
   };
 
