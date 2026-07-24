@@ -22,7 +22,7 @@ import {
   serializeHistory,
 } from "./history-core.js";
 import { renderQr } from "./qr.js";
-import { createAndroidPerformanceTool } from "./android-performance-ui.js?v=20260724-memory-v2";
+import { createAndroidPerformanceTool } from "./android-performance-ui.js?v=20260724-memory-v3";
 
 const tools = [
   { id: "qr", mark: "⌗", name: "链接转二维码", short: "二维码", description: "把链接变成清晰、可下载的二维码。", keywords: "链接 网址 二维码 qr code" },
